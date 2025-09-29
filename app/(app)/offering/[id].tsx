@@ -1,0 +1,1 @@
+export default function OfferingDetail(){return null;}

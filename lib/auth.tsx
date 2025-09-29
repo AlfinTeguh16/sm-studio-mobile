@@ -1,0 +1,1 @@
+export const useAuth = () => ({profile:null,user:null});
