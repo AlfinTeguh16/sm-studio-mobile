@@ -1,1 +1,0 @@
-export default function Bookings(){return null;}

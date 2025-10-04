@@ -1,31 +1,37 @@
 {
   "expo": {
-    "name": "mua-mobile",
+    "name": "SM Studio",
     "slug": "mua-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/splash.jpg",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/splash.jpg",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.mua-mobile"
+      "bundleIdentifier": "com.smstudio.mua",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Lokasi dipakai untuk menampilkan MUA di sekitar Anda."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "permissions": ["ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"],
+  
+      "package": "com.smstudio.mua"
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    }
+    "scheme": "smstudio",
+    "plugins": [
+      "expo-router",
+      "expo-splash-screen",
+      "expo-secure-store"
+    ]
   }
 }
