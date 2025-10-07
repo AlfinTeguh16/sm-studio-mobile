@@ -1,16 +1,8 @@
 // app/(user)/bookings/new.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  Image,
-  TouchableOpacity,
-  ActivityIndicator,
-  TextInput,
-  Alert,
-  Platform,
+  View, Text, StyleSheet, ScrollView, Image, TouchableOpacity,
+  ActivityIndicator, TextInput, Alert, Platform,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -66,7 +58,7 @@ export default function BookingCreateScreen() {
   const [loading, setLoading] = useState(true);
 
   // form
-  const [qty, setQty] = useState(1);
+  const [person, setPerson] = useState(1); // <— jumlah orang, DIKIRIM sebagai `person`
   const [serviceType, setServiceType] = useState<"home_service" | "studio">("home_service");
   const [address, setAddress] = useState("");
   const [notes, setNotes] = useState("");
@@ -79,14 +71,14 @@ export default function BookingCreateScreen() {
   });
   const [showPicker, setShowPicker] = useState<null | "date" | "time">(null);
 
-  // hitung harga
+  // harga
   const priceNum = useMemo(() => Number(item?.price ?? 0), [item]);
-  const subTotal = useMemo(() => Math.max(1, qty) * priceNum, [qty, priceNum]);
-  const TAX_PERCENT = 11; // 11%
+  const subTotal = useMemo(() => Math.max(1, person) * priceNum, [person, priceNum]);
+  const TAX_PERCENT = 11;
   const taxAmount = useMemo(() => (subTotal * TAX_PERCENT) / 100, [subTotal]);
   const grandTotal = useMemo(() => subTotal + taxAmount, [subTotal, taxAmount]);
 
-  // ambil token & customer id
+  // token + me
   useEffect(() => {
     (async () => {
       try {
@@ -98,7 +90,6 @@ export default function BookingCreateScreen() {
           if (id) setCustomerId(String(id));
         }
       } catch {}
-      // fallback dari /auth/me
       try {
         const res = await fetch(API_ME, {
           headers: token ? { Authorization: `Bearer ${token}` } : undefined,
@@ -112,14 +103,19 @@ export default function BookingCreateScreen() {
     })();
   }, [token]);
 
-  // GET offering
+  // GET offering (pakai token kalau endpoint butuh auth)
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (!offeringId) return;
       setLoading(true);
       try {
-        const res = await fetch(`${API_OFFERINGS}/${offeringId}`);
+        const res = await fetch(`${API_OFFERINGS}/${offeringId}`, {
+          headers: {
+            Accept: "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+        });
         const json = await res.json();
         const data: Offering = json?.data ?? json;
         if (mounted) setItem(data);
@@ -132,7 +128,7 @@ export default function BookingCreateScreen() {
     return () => {
       mounted = false;
     };
-  }, [offeringId]);
+  }, [offeringId, token]);
 
   // POST booking
   async function submit() {
@@ -153,17 +149,20 @@ export default function BookingCreateScreen() {
         location_address: serviceType === "home_service" ? address : null,
         notes: notes || null,
 
+        // tambahan baru
+        person: Math.max(1, person),
+
         // invoice meta (opsional)
         invoice_date: ymd(new Date()),
         due_date: ymd(date),
 
         // pricing
-        amount: subTotal, // harga x qty
+        amount: subTotal,           // harga x person
         selected_add_ons: [],
         discount_amount: 0,
-        tax: TAX_PERCENT, // persen
+        tax: TAX_PERCENT,           // persen
 
-        // payment manual
+        // pembayaran manual
         payment_method: "manual",
       };
 
@@ -177,29 +176,27 @@ export default function BookingCreateScreen() {
         body: JSON.stringify(payload),
       });
 
-      const body = await res.json().catch(() => ({} as any));
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(
-          body?.message ||
-            body?.error ||
-            "Gagal membuat booking. Pastikan data sudah benar."
-        );
+        throw new Error(data?.message || data?.error || "Gagal membuat booking. Pastikan data sudah benar.");
       }
 
-      // Ambil ID booking yang dibuat (bisa di body.data.id atau body.id)
-      const createdId = String(body?.data?.id ?? body?.id ?? "");
-      if (!createdId) {
-        Alert.alert(
-          "Berhasil",
-          `Pesanan dibuat tetapi ID tidak ditemukan.\nTotal: ${formatIDR(
-            Number(body?.grand_total ?? grandTotal)
-          )}`
-        );
-        return;
-      }
-
-      // Sukses → arahkan ke halaman invoice
-      router.replace({ pathname: "/(user)/bookings/[id]", params: { id: createdId } });
+      Alert.alert(
+        "Berhasil",
+        `Pesanan dibuat.\nNomor Invoice: ${data?.invoice_number || "-"}\nTotal: ${formatIDR(
+          Number(data?.grand_total ?? grandTotal)
+        )}`,
+        [
+          {
+            text: "Lihat Invoice",
+            onPress: () => {
+              // arahkan ke halaman invoice/bookings detail
+              const id = String(data?.id ?? "");
+              if (id) router.replace({ pathname: "/(user)/bookings/[id]", params: { id } });
+            },
+          },
+        ]
+      );
     } catch (e: any) {
       Alert.alert("Gagal", e?.message || "Tidak bisa mengirim booking.");
     }
@@ -221,18 +218,17 @@ export default function BookingCreateScreen() {
     );
   }
 
-  const hero =
-    item.offer_pictures?.[0] || "https://via.placeholder.com/600x400.png?text=Offering";
+  const hero = item.offer_pictures?.[0] || "https://via.placeholder.com/600x400.png?text=Offering";
 
   return (
     <View style={styles.screen}>
       <ScrollView contentContainerStyle={{ paddingBottom: 120 }}>
-        {/* Header back */}
+        {/* header back */}
         <TouchableOpacity style={styles.back} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={18} color="#111" />
         </TouchableOpacity>
 
-        {/* Kartu ringkas offering */}
+        {/* ringkasan offering */}
         <View style={styles.card}>
           <Image source={{ uri: hero }} style={styles.thumb} />
           <View style={{ flex: 1, paddingLeft: 14 }}>
@@ -240,47 +236,34 @@ export default function BookingCreateScreen() {
               {item.name_offer || "Paket"}
             </Text>
             <Text style={styles.vendor}>SM Studio</Text>
-            <View style={{ flexDirection: "row", alignItems: "center", marginTop: 4 }}>
-              <Ionicons name="location-outline" size={14} color={TEXT_MUTED} />
-              <Text style={styles.addr} numberOfLines={1}>
-                Jl. xxx, Nomor 11, Desa xx, Kec. xx
-              </Text>
-            </View>
           </View>
         </View>
 
-        {/* Nama (opsional tampilkan) */}
-        <Text style={styles.labelBig}>Jennifer M</Text>
-
-        {/* Qty */}
+        {/* jumlah orang */}
         <View style={styles.rowBetween}>
           <Text style={styles.formLabel}>Jumlah Orang</Text>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
             <TouchableOpacity
               style={styles.stepper}
-              onPress={() => setQty((v) => Math.max(1, v - 1))}
+              onPress={() => setPerson((v) => Math.max(1, v - 1))}
             >
               <Ionicons name="remove" size={16} color="#fff" />
             </TouchableOpacity>
-            <Text style={{ fontWeight: "700" }}>{qty}</Text>
-            <TouchableOpacity style={styles.stepper} onPress={() => setQty((v) => v + 1)}>
+            <Text style={{ fontWeight: "700" }}>{person}</Text>
+            <TouchableOpacity style={styles.stepper} onPress={() => setPerson((v) => v + 1)}>
               <Ionicons name="add" size={16} color="#fff" />
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Jadwal */}
+        {/* jadwal */}
         <Text style={[styles.formLabel, { marginTop: 14 }]}>Jadwal</Text>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
           <Text style={{ color: "#111", fontWeight: "600" }}>
-            {`${date.toLocaleTimeString("id-ID", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })} - ${date.toLocaleDateString("id-ID", {
-              day: "2-digit",
-              month: "long",
-              year: "numeric",
-            })}`}
+            {`${date.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })} - ${date.toLocaleDateString(
+              "id-ID",
+              { day: "2-digit", month: "long", year: "numeric" }
+            )}`}
           </Text>
           <TouchableOpacity
             style={styles.dateBtn}
@@ -314,7 +297,7 @@ export default function BookingCreateScreen() {
           </View>
         )}
 
-        {/* Service type (Home/Studio) */}
+        {/* tipe layanan */}
         <View style={{ flexDirection: "row", gap: 8, marginTop: 14 }}>
           {(["home_service", "studio"] as const).map((t) => (
             <TouchableOpacity
@@ -337,7 +320,7 @@ export default function BookingCreateScreen() {
           ))}
         </View>
 
-        {/* Alamat (user) */}
+        {/* alamat (user) */}
         <Text style={[styles.formLabel, { marginTop: 14 }]}>Alamat</Text>
         <TextInput
           placeholder="Jl. xxx, Nomor 11, Desa xx, Kec. xx"
@@ -348,7 +331,7 @@ export default function BookingCreateScreen() {
           editable={serviceType === "home_service"}
         />
 
-        {/* Catatan */}
+        {/* catatan */}
         <Text style={[styles.formLabel, { marginTop: 10 }]}>Catatan</Text>
         <TextInput
           placeholder="Catatan Pesanan"
@@ -361,7 +344,7 @@ export default function BookingCreateScreen() {
           textAlignVertical="top"
         />
 
-        {/* Ringkasan */}
+        {/* ringkasan */}
         <Text style={[styles.sectionTitle, { marginTop: 12 }]}>Ringkasan Pesanan</Text>
         <View style={styles.summaryRow}>
           <Text style={styles.sumLabel}>Harga Jasa</Text>
@@ -413,15 +396,6 @@ const styles = StyleSheet.create({
   thumb: { width: 88, height: 72, borderRadius: 10, backgroundColor: "#eee" },
   cardTitle: { fontSize: 18, fontWeight: "800", color: "#111827" },
   vendor: { marginTop: 4, color: TEXT_MUTED },
-  addr: { marginLeft: 4, color: TEXT_MUTED, flex: 1 },
-
-  labelBig: {
-    marginHorizontal: 16,
-    marginTop: 18,
-    fontSize: 20,
-    fontWeight: "800",
-    color: "#111827",
-  },
 
   formLabel: { marginHorizontal: 16, marginTop: 6, color: "#111827", fontWeight: "700" },
   rowBetween: {

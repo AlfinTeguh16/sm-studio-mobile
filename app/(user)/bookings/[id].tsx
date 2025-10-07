@@ -62,7 +62,8 @@ type MuaLoc = {
 };
 
 /* ================== Consts ================== */
-const API_BASE = "https://smstudio.my.id/api";
+const API_ORIGIN = "https://smstudio.my.id";
+const API_BASE = `${API_ORIGIN}/api`;
 const API_BOOKING = (id: string | number) => `${API_BASE}/bookings/${id}`;
 const API_OFFERING = (id: string | number) => `${API_BASE}/offerings/${id}`;
 const API_MUA_LOC = `${API_BASE}/mua-location`;
@@ -92,29 +93,58 @@ function fmtDate(idt?: string | null) {
   });
 }
 
+type HeaderMap = Record<string, string>;
+
+async function getAuthToken(): Promise<string | null> {
+  const raw = await SecureStore.getItemAsync("auth");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.token === "string" ? parsed.token : null;
+  } catch {
+    return null;
+  }
+}
+async function getAuthHeaders(): Promise<HeaderMap> {
+  const token = await getAuthToken();
+  const h: HeaderMap = { Accept: "application/json" };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+}
+
+async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
+  const given = (init.headers || {}) as HeaderMap;
+  const headers: HeadersInit = { ...given, Accept: "application/json" };
+
+  const res = await fetch(url, {
+    method: init.method ?? "GET",
+    cache: "no-store",
+    ...init,
+    headers,
+  });
+
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 401) throw new Error("401_UNAUTH");
+    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+  }
+}
+
 /* ================== Screen ================== */
 export default function BookingInvoiceScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
 
-  const [token, setToken] = useState<string | null>(null);
   const [booking, setBooking] = useState<Booking | null>(null);
   const [offering, setOffering] = useState<Offering | null>(null);
   const [mua, setMua] = useState<MuaLoc | null>(null);
   const [loading, setLoading] = useState(true);
-
-  // Ambil token kalau ada
-  useEffect(() => {
-    (async () => {
-      try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const a = JSON.parse(raw);
-          if (a?.token) setToken(a.token);
-        }
-      } catch {}
-    })();
-  }, []);
 
   // Fetch booking + (opsional) offering + nama MUA
   useEffect(() => {
@@ -122,37 +152,40 @@ export default function BookingInvoiceScreen() {
     (async () => {
       try {
         setLoading(true);
-        const headers: any = token ? { Authorization: `Bearer ${token}` } : undefined;
+        const headers = await getAuthHeaders();
 
         // booking
-        const bRes = await fetch(API_BOOKING(id), { headers });
-        if (!bRes.ok) throw new Error(`Gagal memuat invoice (#${id})`);
-        const bJson = await bRes.json();
-        const bData: Booking = bJson?.data ?? bJson;
+        const bJson = await safeFetchJSON<{ data?: Booking } | Booking>(API_BOOKING(id), { headers });
+        const bData: Booking = (bJson as any)?.data ?? (bJson as Booking);
         setBooking(bData);
 
         // offering (untuk tampilkan nama jasa, harga awal)
         if (bData?.offering_id) {
-          const oRes = await fetch(API_OFFERING(bData.offering_id), { headers });
-          if (oRes.ok) {
-            const oJson = await oRes.json();
-            setOffering(oJson?.data ?? oJson);
-          }
+          const oJson = await safeFetchJSON<{ data?: Offering } | Offering>(
+            API_OFFERING(bData.offering_id),
+            { headers }
+          );
+          setOffering((oJson as any)?.data ?? (oJson as Offering));
         }
 
         // nama/alamat MUA
-        const mRes = await fetch(API_MUA_LOC);
-        const mJson = await mRes.json();
-        const list: MuaLoc[] = mJson?.data ?? mJson ?? [];
+        const mJson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers });
+        const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
         const found = list.find((m) => m.id === bData.mua_id) || null;
         setMua(found);
       } catch (e: any) {
-        Alert.alert("Oops", e?.message || "Tidak bisa memuat invoice");
+        if (e?.message === "401_UNAUTH") {
+          Alert.alert("Sesi berakhir", "Silakan login kembali.");
+          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          router.replace("/(auth)/login");
+        } else {
+          Alert.alert("Oops", e?.message || "Tidak bisa memuat invoice");
+        }
       } finally {
         setLoading(false);
       }
     })();
-  }, [id, token]);
+  }, [id, router]);
 
   // Hitung total (fallback jika backend tidak kirim beberapa field)
   const computed = useMemo(() => {
@@ -190,10 +223,15 @@ export default function BookingInvoiceScreen() {
     return (
       <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
         <Text>Invoice tidak ditemukan.</Text>
-        <TouchableOpacity style={[styles.btn, { marginTop: 10 }]} onPress={() => router.replace("/(user)/index")}>
+        <TouchableOpacity
+          style={[styles.btn, { marginTop: 10, backgroundColor: PURPLE }]}
+          onPress={() => router.replace("/(user)/index")}>
           <Text style={{ color: "#fff", fontWeight: "700" }}>Kembali ke Beranda</Text>
         </TouchableOpacity>
       </View>
+    
+
+
     );
   }
 
@@ -381,7 +419,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  
 
   infoBox: {
     flexDirection: "row",

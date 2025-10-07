@@ -31,7 +31,7 @@ export default function Register() {
   };
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
+
       <View style={{ padding: 20, gap: 8 }}>
         <Text style={{ fontSize: 24, fontWeight: "700" }}>
           {isMua ? "Daftar sebagai MUA" : "Daftar sebagai Pengguna"}
@@ -43,6 +43,6 @@ export default function Register() {
           {loading ? <ActivityIndicator/> : <Text style={{ color: "#fff", fontWeight: "700" }}>Buat Akun</Text>}
         </TouchableOpacity>
       </View>
-    </SafeAreaView>
+
   );
 }

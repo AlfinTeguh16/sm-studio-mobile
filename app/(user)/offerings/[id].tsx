@@ -12,6 +12,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter, useNavigation } from "expo-router";
 import MapView, { Marker } from "react-native-maps";
+import * as SecureStore from "expo-secure-store";
 
 /* ============ Types ============ */
 type Offering = {
@@ -20,7 +21,6 @@ type Offering = {
   name_offer: string;
   offer_pictures?: string[];
   makeup_type?: string;
-  person?: number;
   collaboration?: string | null;
   collaboration_price?: string | number | null;
   add_ons?: string[];
@@ -39,7 +39,8 @@ type MuaLoc = {
 };
 
 /* ============ Const ============ */
-const API_BASE = "https://smstudio.my.id/api";
+const API_ORIGIN = "https://smstudio.my.id";
+const API_BASE = `${API_ORIGIN}/api`;
 const API_OFFERINGS = `${API_BASE}/offerings`;
 const API_MUA_LOC = `${API_BASE}/mua-location`;
 const PURPLE = "#AA60C8";
@@ -55,10 +56,61 @@ const titleCase = (s?: string) =>
     .toLowerCase()
     .replace(/\b\w/g, (c) => c.toUpperCase());
 
+type HeaderMap = Record<string, string>;
+
+function absolutize(url: string | null | undefined) {
+  if (!url) return null;
+  if (/^https?:\/\//i.test(url)) return url.replace(/^http:\/\//i, "https://");
+  return `${API_ORIGIN}${url.startsWith("/") ? url : `/${url}`}`;
+}
+
+async function getAuthToken(): Promise<string | null> {
+  const raw = await SecureStore.getItemAsync("auth");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.token === "string" ? parsed.token : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getAuthHeaders(): Promise<HeaderMap> {
+  const token = await getAuthToken();
+  const h: HeaderMap = { Accept: "application/json" };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+}
+
+async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
+  // gabungkan headers secara type-safe
+  const given = (init.headers || {}) as HeaderMap;
+  const headers: HeadersInit = { ...given, Accept: "application/json" };
+
+  const res = await fetch(url, {
+    method: init.method ?? "GET",
+    cache: "no-store",
+    ...init,
+    headers,
+  });
+
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 401) throw new Error("401_UNAUTH");
+    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+  }
+}
+
 /* ============ Screen ============ */
 export default function OfferingDetail() {
   const router = useRouter();
-  const navigation = useNavigation(); // <-- untuk sembunyikan header
+  const navigation = useNavigation(); // sembunyikan header
   const { id } = useLocalSearchParams<{ id: string }>();
 
   const [item, setItem] = useState<Offering | null>(null);
@@ -68,28 +120,41 @@ export default function OfferingDetail() {
 
   // Sembunyikan header default “offerings/[id]”
   useEffect(() => {
-    navigation.setOptions({ headerShown: false });
+    navigation.setOptions?.({ headerShown: false });
   }, [navigation]);
 
   useEffect(() => {
     if (!id) return;
 
     (async () => {
+      setLoading(true);
       try {
+        const headers = await getAuthHeaders();
+
         // 1) detail offering
-        const res = await fetch(`${API_OFFERINGS}/${id}`);
-        const json = await res.json();
-        const data: Offering = json?.data ?? json;
+        const detail = await safeFetchJSON<{ data?: Offering } | Offering>(
+          `${API_OFFERINGS}/${id}`,
+          { headers }
+        );
+        const data: Offering = (detail as any)?.data ?? (detail as Offering);
         setItem(data);
 
         // 2) lokasi MUA
-        const mres = await fetch(API_MUA_LOC);
-        const mjson = await mres.json();
-        const list: MuaLoc[] = mjson?.data ?? mjson ?? [];
+        const mjson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(
+          API_MUA_LOC,
+          { headers }
+        );
+        const list: MuaLoc[] = (mjson as any)?.data ?? (mjson as MuaLoc[]) ?? [];
         const found = list.find((m) => m.id === data.mua_id) || null;
         setMua(found);
       } catch (e: any) {
-        Alert.alert("Gagal", e?.message || "Tidak bisa memuat detail");
+        if (e?.message === "401_UNAUTH") {
+          Alert.alert("Sesi berakhir", "Silakan login kembali.");
+          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          router.replace("/(auth)/login");
+        } else {
+          Alert.alert("Gagal", e?.message || "Tidak bisa memuat detail");
+        }
       } finally {
         setLoading(false);
       }
@@ -203,14 +268,14 @@ export default function OfferingDetail() {
 
         {/* CTA */}
         <TouchableOpacity
-            style={styles.cta}
-            onPress={() =>
-              router.push({
-                pathname: "/(user)/bookings/new",
-                params: { offeringId: String(item?.id ?? id) }, // kirim ID offering
-              })
-            }
-          >
+          style={styles.cta}
+          onPress={() =>
+            router.push({
+              pathname: "/(user)/bookings/new",
+              params: { offeringId: String(item?.id ?? id) }, // kirim ID offering
+            })
+          }
+        >
           <Text style={{ color: "#fff", fontWeight: "800" }}>Pesan Sekarang</Text>
         </TouchableOpacity>
       </View>
