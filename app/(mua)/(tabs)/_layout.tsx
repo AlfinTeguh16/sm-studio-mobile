@@ -2,13 +2,13 @@ import React from "react";
 import { Tabs } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { Platform } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+
 
 const PURPLE = "#AA60C8";
 
 export default function MuaTabsLayout() {
   return (
-     <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }} edges={["top", "bottom"]}>
+
     <Tabs
       screenOptions={{
         headerShown: false,
@@ -51,6 +51,6 @@ export default function MuaTabsLayout() {
         }}
       />
     </Tabs>
-    </SafeAreaView>
+
   );
 }

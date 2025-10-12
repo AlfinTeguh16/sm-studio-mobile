@@ -17,7 +17,7 @@ import Svg, { Path, Defs, LinearGradient as SvgGrad, Stop, Rect } from "react-na
 
 /* ================== Types ================== */
 type Me = {
-  id?: string;                // profile id (UUID)
+  id?: string; // profile id (UUID)
   name?: string;
   profile?: { id?: string; name?: string; role?: string };
 };
@@ -27,9 +27,10 @@ type Booking = {
   customer_id: string;
   mua_id: string;
   offering_id?: number | null;
-  booking_date: string; // ISO
+  booking_date: string; // YYYY-MM-DD
   booking_time: string; // "HH:MM"
   status: "pending" | "confirmed" | "rejected" | "cancelled" | "completed";
+  updated_at?: string | null; // <-- ditambahkan: sumber bulan untuk "completed"
 };
 
 type Portfolio = {
@@ -43,8 +44,9 @@ type SparkDatum = number;
 
 /* ================== Const ================== */
 const API = "https://smstudio.my.id/api";
+const BASE = API.replace(/\/api$/, ""); // => https://smstudio.my.id
 const API_ME = `${API}/auth/me`;
-const API_BOOKINGS = `${API}/bookings`;
+const API_BOOKINGS = `${API}/bookings`; // <-- sumber kebenaran tunggal
 const API_PORTFOLIOS = `${API}/portfolios`;
 
 const PURPLE = "#AA60C8";
@@ -65,10 +67,27 @@ const fmtDateTimeShort = (isoDate: string, hhmm: string) => {
 
 const toJSDate = (b: Booking) => new Date(`${b.booking_date}T${b.booking_time}:00`);
 
+// Ambil bulan "completed" dari updated_at (fallback ke booking_date/time)
+const monthFromUpdatedOrBooking = (b: Booking): number | null => {
+  if (b.updated_at) {
+    const d = new Date(b.updated_at);
+    if (Number.isFinite(+d)) return d.getMonth();
+  }
+  const d2 = toJSDate(b);
+  return Number.isFinite(+d2) ? d2.getMonth() : null;
+};
+
+const normPhoto = (u?: string | null) => {
+  if (!u) return null;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  if (u.startsWith("/")) return `${BASE}${u}`;
+  return u;
+};
+
 /* ================== Tiny Sparkline ================== */
 function Sparkline({
   data,
-  width = 280,
+  width = 320,
   height = 120,
 }: {
   data: SparkDatum[];
@@ -149,41 +168,94 @@ export default function MuaDashboard() {
     })();
   }, [token]);
 
-  // fetch bookings
+  // fetch SEMUA bookings via /api/bookings (paginate until done) -> filter by mua_id & completed di server
   useEffect(() => {
     if (!me.id) return;
+
+    let alive = true;
+
     (async () => {
       setLoadingBookings(true);
       try {
-        const res = await fetch(API_BOOKINGS);
-        const j = await res.json();
-        const rows: Booking[] = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : [];
-        setBookings(rows.filter((b) => b.mua_id === me.id));
+        const perPage = 100;
+        let page = 1;
+        let all: Booking[] = [];
+        let nextUrl: string | null =
+          `${API_BOOKINGS}?mua_id=${encodeURIComponent(String(me.id))}` +
+          `&status=completed&per_page=${perPage}&page=${page}`;
+
+        while (nextUrl) {
+          const response: Response = await fetch(nextUrl, {
+            headers: {
+              Accept: "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+          });
+          const json: any = await response.json().catch(() => ({} as any));
+
+          const pageData: Booking[] = Array.isArray(json?.data)
+            ? (json.data as Booking[])
+            : Array.isArray(json)
+            ? (json as Booking[])
+            : [];
+
+          all = all.concat(pageData);
+
+          if (json?.next_page_url) {
+            nextUrl = json.next_page_url as string | null;
+          } else if (pageData.length === perPage) {
+            page += 1;
+            nextUrl =
+              `${API_BOOKINGS}?mua_id=${encodeURIComponent(String(me.id))}` +
+              `&status=completed&per_page=${perPage}&page=${page}`;
+          } else {
+            nextUrl = null;
+          }
+          if (page > 20) nextUrl = null; // guard
+        }
+
+        if (alive) setBookings(all);
       } catch {
-        setBookings([]);
+        if (alive) setBookings([]);
       } finally {
-        setLoadingBookings(false);
+        if (alive) setLoadingBookings(false);
       }
     })();
-  }, [me.id]);
 
-  // fetch portfolios
+    return () => {
+      alive = false;
+    };
+  }, [me.id, token]);
+
+  // fetch portfolios (pakai ?muaId=…)
   useEffect(() => {
     if (!me.id) return;
+
+    let alive = true;
     (async () => {
       setLoadingPortfolios(true);
       try {
-        const res = await fetch(`${API_PORTFOLIOS}?mua_id=${me.id}`);
-        const j = await res.json();
+        const url = `${API_PORTFOLIOS}?muaId=${encodeURIComponent(String(me.id))}&per_page=20&sort=created_at&dir=desc`;
+        const res = await fetch(url, {
+          headers: {
+            Accept: "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+        });
+        const j = await res.json().catch(() => ({}));
         const rows: Portfolio[] = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : [];
-        setPortfolios(rows);
+        if (alive) setPortfolios(rows);
       } catch {
-        setPortfolios([]);
+        if (alive) setPortfolios([]);
       } finally {
-        setLoadingPortfolios(false);
+        if (alive) setLoadingPortfolios(false);
       }
     })();
-  }, [me.id]);
+
+    return () => {
+      alive = false;
+    };
+  }, [me.id, token]);
 
   // jadwal mendatang terdekat (pending|confirmed di masa depan)
   const upcoming = useMemo(() => {
@@ -193,19 +265,45 @@ export default function MuaDashboard() {
       .sort((a, b) => +toJSDate(a) - +toJSDate(b))[0];
   }, [bookings]);
 
-  // total pekerjaan selesai
-  const totalDone = useMemo(() => bookings.filter((b) => b.status === "completed").length, [bookings]);
+  // total selesai sepanjang waktu (dari /bookings)
+  const totalDoneAllTime = useMemo(
+    () => bookings.filter((b) => b.status === "completed").length,
+    [bookings]
+  );
 
-  // dummy grafik: hitung jumlah job per bulan dari bookings
+  // jumlah selesai per bulan (menggunakan updated_at sebagai sumber bulan)
+  const completedByMonth = useMemo(() => {
+    const byMonth = new Array(12).fill(0);
+    bookings.forEach((b) => {
+      if (b.status !== "completed") return;
+      const m = monthFromUpdatedOrBooking(b);
+      if (m != null) byMonth[m] += 1;
+    });
+    return byMonth;
+  }, [bookings]);
+
+  // total selesai bulan ini
+  const totalDoneThisMonth = useMemo(() => {
+    const m = new Date().getMonth();
+    return completedByMonth[m] || 0;
+  }, [completedByMonth]);
+
+  // total pekerjaan selesai (completed saja) — milik user login (redundan karena fetch sudah filter by mua_id)
+  const totalDone = useMemo(
+    () => bookings.filter((b) => b.status === "completed" && b.mua_id === me.id).length,
+    [bookings, me.id]
+  );
+
+  // data grafik: count completed per bulan berdasarkan updated_at (fallback booking_date/time)
   const chartData = useMemo(() => {
     const byMonth = new Array(12).fill(0);
     bookings.forEach((b) => {
-      const d = toJSDate(b);
-      byMonth[d.getMonth()] += 1;
+      if (b.status !== "completed" || b.mua_id !== me.id) return;
+      const m = monthFromUpdatedOrBooking(b);
+      if (m != null) byMonth[m] += 1;
     });
-    // buat lebih enak dilihat
-    return byMonth.slice(0, 12).map((n) => n || 0);
-  }, [bookings]);
+    return byMonth;
+  }, [bookings, me.id]);
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 24 }}>
@@ -215,7 +313,10 @@ export default function MuaDashboard() {
           <Text style={styles.hello}>Hello, {me.name || "MUA"}</Text>
           <Text style={styles.subtitle}>Let's make a great things today!</Text>
         </View>
-        <TouchableOpacity style={styles.bell} onPress={() => router.push("/(mua)/notifications")}>
+        <TouchableOpacity
+          style={styles.bell}
+          onPress={() => router.push("notifications")}
+        >
           <Ionicons name="notifications-outline" size={18} color="#fff" />
         </TouchableOpacity>
       </View>
@@ -258,11 +359,17 @@ export default function MuaDashboard() {
         </View>
       </LinearGradient>
 
-      {/* Grafik pekerjaan */}
+      {/* Grafik pekerjaan: jumlah completed per bulan (updated_at) */}
       <View style={{ paddingHorizontal: 20, marginTop: 18 }}>
-        <Text style={styles.blockTitle}>Grafik Pekerjaan Anda</Text>
+        <Text style={styles.blockTitle}>Pekerjaan Selesai per Bulan</Text>
         <View style={styles.chartCard}>
           <Sparkline data={chartData} width={320} height={120} />
+          <View style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 6 }}>
+            <Text style={{ color: MUTED, fontSize: 12 }}>Jan–Des (tahun berjalan)</Text>
+            <Text style={{ color: MUTED, fontSize: 12 }}>
+              Bulan ini: <Text style={{ color: "#111827", fontWeight: "800" }}>{totalDoneThisMonth}</Text>
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -270,7 +377,10 @@ export default function MuaDashboard() {
       <View style={{ paddingHorizontal: 20, marginTop: 12 }}>
         <View style={styles.kpiCard}>
           <Text style={styles.kpiTitle}>Total Pekerjaan Selesai</Text>
-          <Text style={styles.kpiValue}>{totalDone}</Text>
+          <Text style={styles.kpiValue}>{totalDoneAllTime}</Text>
+          <Text style={{ color: MUTED, marginTop: 4 }}>
+            Bulan ini: <Text style={{ color: "#111827", fontWeight: "800" }}>{totalDoneThisMonth}</Text>
+          </Text>
         </View>
       </View>
 
@@ -292,8 +402,8 @@ export default function MuaDashboard() {
           <Text style={{ color: MUTED, marginTop: 8 }}>Belum ada portofolio.</Text>
         ) : (
           portfolios.map((p) => {
-            const cover =
-              (Array.isArray(p.photos) && p.photos[0]) || "https://via.placeholder.com/600x400.png?text=Portfolio";
+            const first = Array.isArray(p.photos) ? p.photos[0] : null;
+            const cover = normPhoto(first) || "https://via.placeholder.com/600x400.png?text=Portfolio";
             return (
               <View key={p.id} style={styles.portCard}>
                 <Image source={{ uri: cover }} style={styles.portPhoto} />
@@ -331,20 +441,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingTop: 18,
     paddingBottom: 8,
+    gap: 10,
     flexDirection: "row",
-    alignItems: "center",
     justifyContent: "space-between",
+    alignItems: "center"
   },
-  hello: { fontSize: 26, fontWeight: "800", color: "#111827" },
+  hello: { fontSize: 20, fontWeight: "600", color: "#111827", flexWrap: "wrap", flex: 1, marginRight: 10 },
+  bell: { backgroundColor: PURPLE, width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
+
   subtitle: { color: MUTED, marginTop: 4 },
-  bell: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: PURPLE,
-    alignItems: "center",
-    justifyContent: "center",
-  },
 
   nextCard: {
     marginHorizontal: 20,

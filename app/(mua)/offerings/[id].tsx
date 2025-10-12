@@ -2,13 +2,15 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, Image, TouchableOpacity,
-  ActivityIndicator, Alert, RefreshControl
+  ActivityIndicator, Alert, RefreshControl, useWindowDimensions,
+  NativeScrollEvent, NativeSyntheticEvent
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 
 const API = "https://smstudio.my.id/api";
+const BASE = API.replace(/\/api$/,""); // untuk prefix /storage/...
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const TEXT = "#111827";
@@ -19,7 +21,7 @@ type Offering = {
   id: number;
   mua_id: string;
   name_offer: string;
-  offer_pictures?: string[];
+  offer_pictures?: string[] | null;
   makeup_type?: string | null;
   person?: number | null;
   collaboration?: string | null;
@@ -49,18 +51,30 @@ function useOfferingId() {
   return Array.isArray(raw) ? raw[0] : raw;
 }
 
+function absolutize(u: string) {
+  if (!u) return u;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  if (u.startsWith("/storage/")) return `${BASE}${u}`;
+  return u;
+}
+
 export default function MuaOfferingDetail() {
   const router = useRouter();
   const id = useOfferingId();
+  const { width } = useWindowDimensions();
 
   const [token, setToken] = useState<string | null>(null);
-  const [tokenReady, setTokenReady] = useState(false); // <— penanda token sudah dicoba dibaca
+  const [tokenReady, setTokenReady] = useState(false);
   const [item, setItem] = useState<Offering | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  // Ambil token dari SecureStore
+  // slider state
+  const picturesRaw = useMemo(() => item?.offer_pictures ?? [], [item]);
+  const pictures = useMemo(() => (picturesRaw || []).map(absolutize).filter(Boolean), [picturesRaw]);
+  const [slide, setSlide] = useState(0);
+
   useEffect(() => {
     (async () => {
       try {
@@ -80,7 +94,6 @@ export default function MuaOfferingDetail() {
       setLoading(false);
       return;
     }
-    // Kalau endpoint dilindungi dan tidak ada token → minta login
     if (!token) {
       setLoading(false);
       Alert.alert("Perlu Login", "Silakan login untuk melihat detail offering.", [
@@ -92,22 +105,14 @@ export default function MuaOfferingDetail() {
 
     setLoading(true);
     try {
-      const url = `${API}/offerings/${encodeURIComponent(id)}`;
-      const res = await fetch(url, {
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${token}`,
-          "X-Requested-With": "XMLHttpRequest",
-        },
+      const res = await fetch(`${API}/offerings/${encodeURIComponent(id)}`, {
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
       });
 
       if (!res.ok) {
-        // log untuk debug
         const txt = await res.text().catch(() => "");
         console.warn("GET /offerings/:id failed", res.status, txt);
-        if (res.status === 401) {
-          throw new Error("Sesi berakhir atau belum login.");
-        }
+        if (res.status === 401) throw new Error("Sesi berakhir atau belum login.");
         throw new Error(`Gagal memuat (status ${res.status})`);
       }
 
@@ -115,12 +120,10 @@ export default function MuaOfferingDetail() {
       const data: Offering | null =
         (json && typeof json === "object" && "data" in json ? (json.data as Offering) : (json as Offering)) || null;
 
-      if (!data || typeof data.id === "undefined") {
-        console.warn("Unexpected payload:", json);
-        throw new Error("Format data tidak sesuai");
-      }
+      if (!data || typeof data.id === "undefined") throw new Error("Format data tidak sesuai");
 
       setItem(data);
+      setSlide(0);
     } catch (e: any) {
       setItem(null);
       Alert.alert(
@@ -135,7 +138,6 @@ export default function MuaOfferingDetail() {
     }
   }, [id, token, router]);
 
-  // Panggil fetch saat id & tokenReady siap (dan setiap token berubah)
   useEffect(() => {
     if (!tokenReady) return;
     fetchDetail();
@@ -147,8 +149,11 @@ export default function MuaOfferingDetail() {
     setRefreshing(false);
   }, [fetchDetail]);
 
-  const pictures = useMemo(() => item?.offer_pictures ?? [], [item]);
-  const hero = pictures[0] || "https://via.placeholder.com/1200x800.png?text=Offering";
+  function onHeroScroll(e: NativeSyntheticEvent<NativeScrollEvent>) {
+    const x = e.nativeEvent.contentOffset.x;
+    const idx = Math.round(x / Math.max(1, width));
+    if (idx !== slide) setSlide(idx);
+  }
 
   async function handleDelete() {
     if (!id || !token) return;
@@ -162,11 +167,7 @@ export default function MuaOfferingDetail() {
             setDeleting(true);
             const res = await fetch(`${API}/offerings/${encodeURIComponent(id)}`, {
               method: "DELETE",
-              headers: {
-                Accept: "application/json",
-                Authorization: `Bearer ${token}`,
-                "X-Requested-With": "XMLHttpRequest",
-              },
+              headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
             });
             if (!res.ok) {
               const msg = (await res.json().catch(() => ({})))?.message || `Gagal (status ${res.status})`;
@@ -203,6 +204,9 @@ export default function MuaOfferingDetail() {
     );
   }
 
+  const canSlide = pictures.length > 1;
+  const heroFallback = "https://via.placeholder.com/1200x800.png?text=Offering";
+
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
@@ -226,15 +230,64 @@ export default function MuaOfferingDetail() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         contentContainerStyle={{ paddingBottom: 24 }}
       >
-        <Image source={{ uri: hero }} style={styles.hero} />
+        {/* HERO SLIDER */}
+        {canSlide ? (
+          <View>
+            <ScrollView
+              horizontal
+              pagingEnabled
+              showsHorizontalScrollIndicator={false}
+              onScroll={onHeroScroll}
+              scrollEventThrottle={16}
+            >
+              {pictures.map((u, i) => (
+                <Image
+                  key={`${u}-${i}`}
+                  source={{ uri: u || heroFallback }}
+                  style={[styles.hero, { width }]}
+                />
+              ))}
+            </ScrollView>
+
+            {/* dots */}
+            <View style={styles.dotsWrap}>
+              {pictures.map((_, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.dot,
+                    i === slide && styles.dotActive,
+                  ]}
+                />
+              ))}
+            </View>
+          </View>
+        ) : (
+          <Image source={{ uri: pictures[0] || heroFallback }} style={[styles.hero, { width }]} />
+        )}
+
+        {/* Thumbnails (opsional) */}
         {pictures.length > 1 && (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 8 }}>
-            {pictures.slice(1).map((p, i) => (
-              <Image key={i} source={{ uri: p }} style={[styles.thumb, { marginRight: 8 }]} />
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 8 }}
+          >
+            {pictures.map((p, i) => (
+              <TouchableOpacity key={i} onPress={() => setSlide(i)}>
+                <Image
+                  source={{ uri: p }}
+                  style={[
+                    styles.thumb,
+                    { marginRight: 8, borderColor: i === slide ? PURPLE : BORDER },
+                  ]}
+                />
+              </TouchableOpacity>
             ))}
           </ScrollView>
         )}
 
+        {/* Detail */}
         <View style={{ paddingHorizontal: 16, paddingTop: 14 }}>
           <Text style={styles.title}>{item.name_offer || "Tanpa Judul"}</Text>
           <Text style={styles.price}>{formatIDR(item.price)}</Text>
@@ -264,14 +317,6 @@ export default function MuaOfferingDetail() {
             <Text style={styles.value}>{toDateLabel(item.date)}</Text>
           </View>
 
-          <View style={[styles.metaBox, { marginTop: 12 }]}>
-            <Text style={styles.metaText}>
-              Dibuat: <Text style={{ fontWeight: "700" }}>{toDateLabel(item.created_at)}</Text>
-            </Text>
-            <Text style={styles.metaText}>
-              Diubah: <Text style={{ fontWeight: "700" }}>{toDateLabel(item.updated_at)}</Text>
-            </Text>
-          </View>
         </View>
       </ScrollView>
 
@@ -305,8 +350,30 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
     flexDirection: "row",
   },
-  hero: { width: "100%", height: 230, backgroundColor: "#eee" },
-  thumb: { width: 90, height: 64, backgroundColor: "#eee", borderRadius: 10, borderWidth: 1, borderColor: BORDER },
+
+  /* hero & slider */
+  hero: { height: 260, backgroundColor: "#eee" },
+  dotsWrap: {
+    position: "absolute",
+    bottom: 10,
+    left: 0, right: 0,
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 6,
+  },
+  dot: {
+    width: 8, height: 8, borderRadius: 4,
+    backgroundColor: "#ffffff88",
+  },
+  dotActive: {
+    backgroundColor: PURPLE,
+  },
+
+  thumb: {
+    width: 90, height: 64, backgroundColor: "#eee",
+    borderRadius: 10, borderWidth: 2, borderColor: BORDER,
+  },
+
   title: { fontSize: 22, fontWeight: "800", color: TEXT },
   price: { marginTop: 6, fontSize: 18, fontWeight: "800", color: TEXT },
   row: {
@@ -327,6 +394,7 @@ const styles = StyleSheet.create({
     padding: 12,
   },
   metaText: { color: MUTED, marginTop: 2 },
+
   primaryBtn: {
     flexDirection: "row",
     alignItems: "center",

@@ -304,7 +304,7 @@ export default function UserDashboard() {
         <Text style={styles.hello}>
           Hello, <Text style={{ fontWeight: "600" }}>{displayName || "User"}</Text>
         </Text>
-        <TouchableOpacity onPress={() => router.push("/(user)/notifications")} style={styles.bell}>
+        <TouchableOpacity onPress={() => router.push("/(user)/notifications/")} style={styles.bell}>
           <Ionicons name="notifications-outline" size={18} color="#fff" />
         </TouchableOpacity>
       </View>
@@ -393,9 +393,9 @@ export default function UserDashboard() {
         title="Temukan MUA"
         rightAction={
           // Jika nanti ada screen list MUA khusus, arahkan ke sana (mis. "/(user)/mua")
-          <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/index")}>
-            <Text style={styles.moreText}>Lebih Banyak</Text>
-            <Ionicons name="arrow-forward" size={14} color="#6B7280" />
+          <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/(tabs)/mua")}>
+            <Text style={styles.moreText}></Text>
+            {/* <Ionicons name="arrow-forward" size={14} color="#6B7280" /> */}
           </TouchableOpacity>
         }
         leftAction={

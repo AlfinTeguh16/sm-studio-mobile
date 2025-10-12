@@ -22,13 +22,12 @@ type Booking = {
   customer_id: string;
   mua_id: string;
   offering_id?: number | null;
-  booking_date: string;     // ISO date/time string
-  booking_time: string;     // "HH:mm"
+  booking_date: string;
+  booking_time: string;
   service_type: "home_service" | "studio";
   location_address?: string | null;
   notes?: string | null;
 
-  // invoice + pricing
   invoice_number?: string | null;
   invoice_date?: string | null;
   due_date?: string | null;
@@ -67,6 +66,7 @@ const API_BASE = `${API_ORIGIN}/api`;
 const API_BOOKING = (id: string | number) => `${API_BASE}/bookings/${id}`;
 const API_OFFERING = (id: string | number) => `${API_BASE}/offerings/${id}`;
 const API_MUA_LOC = `${API_BASE}/mua-location`;
+const API_BOOKING_COMPLETE = (id: string | number) => `${API_BASE}/bookings/${id}/complete`;
 
 const PURPLE = "#AA60C8";
 const MUTED = "#6B7280";
@@ -145,6 +145,7 @@ export default function BookingInvoiceScreen() {
   const [offering, setOffering] = useState<Offering | null>(null);
   const [mua, setMua] = useState<MuaLoc | null>(null);
   const [loading, setLoading] = useState(true);
+  const [updating, setUpdating] = useState(false); // <-- indikator update status
 
   // Fetch booking + (opsional) offering + nama MUA
   useEffect(() => {
@@ -208,8 +209,35 @@ export default function BookingInvoiceScreen() {
     const s = (booking?.payment_status || "unpaid").toLowerCase();
     if (s === "paid") return "#16A34A";
     if (s === "refunded") return "#0EA5E9";
-    return "#F59E0B"; // unpaid/pending
+    return "#F59E0B";
   }, [booking]);
+
+  
+  async function markCompleted() {
+    try {
+      if (!id) return;
+      setUpdating(true);
+      const headers = await getAuthHeaders();
+  
+      // Panggil route: Route::post('bookings/{booking}/complete', ...)
+      const result = await safeFetchJSON<{ data?: Booking } | Booking>(
+        API_BOOKING_COMPLETE(id),
+        {
+          method: "POST",
+          headers,              // JANGAN set Content-Type manual kalau tanpa body
+          // body: JSON.stringify({}) // (opsional, hapus kalau controller tak butuh body)
+        }
+      );
+  
+      const updated: Booking = (result as any)?.data ?? (result as Booking);
+      setBooking(updated);
+      Alert.alert("Berhasil", "Status booking ditandai selesai.");
+    } catch (e: any) {
+      Alert.alert("Gagal", e?.message || "Tidak bisa mengubah status.");
+    } finally {
+      setUpdating(false);
+    }
+  }
 
   if (loading) {
     return (
@@ -225,19 +253,17 @@ export default function BookingInvoiceScreen() {
         <Text>Invoice tidak ditemukan.</Text>
         <TouchableOpacity
           style={[styles.btn, { marginTop: 10, backgroundColor: PURPLE }]}
-          onPress={() => router.replace("/(user)/index")}>
+          onPress={() => router.replace("/")}>
           <Text style={{ color: "#fff", fontWeight: "700" }}>Kembali ke Beranda</Text>
         </TouchableOpacity>
       </View>
-    
-
-
     );
   }
 
   const title = offering?.name_offer || "Paket/Jasa";
   const inv = booking.invoice_number || `INV-${booking.id}`;
   const waktu = `${fmtDate(booking.booking_date)} • ${booking.booking_time || "-"}`;
+  const isCompleted = booking.status === "completed";
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
@@ -299,7 +325,7 @@ export default function BookingInvoiceScreen() {
         {booking.notes ? <Row label="Catatan" value={booking.notes} /> : null}
       </View>
 
-      {/* Ringkasan pembayaran */}
+      {/* Ringkasan pembayaran + CTA */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Ringkasan Pembayaran</Text>
 
@@ -319,6 +345,25 @@ export default function BookingInvoiceScreen() {
             }}
           >
             <Text style={{ color: "#fff", fontWeight: "800" }}>Salin No. Invoice</Text>
+          </TouchableOpacity>
+
+          {/* === NEW: tombol 'Selesai' === */}
+          <TouchableOpacity
+            disabled={isCompleted || updating}
+            style={[
+              styles.btn,
+              { backgroundColor: isCompleted ? "#D1D5DB" : "#10B981" },
+              (isCompleted || updating) && { opacity: 0.7 },
+            ]}
+            onPress={markCompleted}
+          >
+            {updating ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={{ color: "#fff", fontWeight: "800" }}>
+                {isCompleted ? "Sudah Selesai" : "Selesai"}
+              </Text>
+            )}
           </TouchableOpacity>
 
           <TouchableOpacity
