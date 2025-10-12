@@ -8,12 +8,15 @@ import {
   Image,
   TouchableOpacity,
   ActivityIndicator,
+  Alert,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import Svg, { Path, Defs, LinearGradient as SvgGrad, Stop, Rect } from "react-native-svg";
+import { ensureLocationPermission } from "../../../src/permissions";
+
 
 /* ================== Types ================== */
 type Me = {
@@ -305,8 +308,28 @@ export default function MuaDashboard() {
     return byMonth;
   }, [bookings, me.id]);
 
+  /* ------------------ Fetch helpers ------------------ */
+  const [coords, setCoords] = useState<{lat:number; lng:number} | null>(null);
+
+  async function onGetLocation() {
+    try {
+      const pos = await ensureLocationPermission();
+      setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    } catch (e:any) {
+      Alert.alert("Izin Dibutuhkan", e?.message || "Gagal mengambil lokasi.");
+    }
+  }
+
+
+
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 24 }}>
+      <View>
+        <TouchableOpacity onPress={onGetLocation}>
+          <Text>Ambil Lokasi</Text>
+        </TouchableOpacity>
+        {coords && <Text>{coords.lat}, {coords.lng}</Text>}
+      </View>
       {/* Header */}
       <View style={styles.header}>
         <View>

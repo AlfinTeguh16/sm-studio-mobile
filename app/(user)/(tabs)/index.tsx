@@ -28,7 +28,7 @@ type MuaApi = {
   location_lat: string;
   location_lng: string;
   address: string;
-  photo_url: string;
+  photo_url: string | null;
 };
 type Mua = {
   id: string;
@@ -36,7 +36,7 @@ type Mua = {
   address: string;
   lat: number;
   lng: number;
-  photo: string;
+  photo: string;          // sudah dinormalisasi jadi URL absolut / placeholder
   distanceKm?: number;
 };
 type OfferingApi = {
@@ -61,6 +61,7 @@ const API_ORIGIN = "https://smstudio.my.id";
 const API_BASE = `${API_ORIGIN}/api`;
 const API_NEARBY = `${API_BASE}/mua-location`;
 const API_OFFERINGS = `${API_BASE}/offerings`;
+const PLACEHOLDER_AVATAR = "https://via.placeholder.com/96x96.png?text=MUA";
 
 /* ---------- Helpers ---------- */
 type HeaderMap = Record<string, string>;
@@ -116,12 +117,27 @@ function safeNum(v: any): number | undefined {
 function formatIDR(v: number) {
   return new Intl.NumberFormat("id-ID").format(v);
 }
-
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return Promise.race<T>([
     p,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error("Location timeout")), ms)),
   ]);
+}
+
+/** Pastikan foto_url jadi URL absolut ke domain, mendukung:
+ *  - "https://..." → kembalikan apa adanya
+ *  - "/storage/profile_photos/xxx.jpg" → prepend API_ORIGIN
+ *  - "storage/profile_photos/xxx.jpg" → prepend API_ORIGIN + "/"
+ *  - nilai kosong/null → placeholder
+ */
+function resolvePhotoUrl(u?: string | null): string {
+  if (!u) return PLACEHOLDER_AVATAR;
+  const s = String(u);
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  if (s.startsWith("/")) return `${API_ORIGIN}${s}`;
+  if (s.startsWith("storage/")) return `${API_ORIGIN}/${s}`;
+  // fallback lain tetap coba absolutkan
+  return `${API_ORIGIN}/${s.replace(/^\/+/, "")}`;
 }
 
 async function getSafeUserCoords(): Promise<{ lat: number; lng: number } | null> {
@@ -221,14 +237,17 @@ export default function UserDashboard() {
         const headers = await getAuthHeaders();
         const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_NEARBY, { headers });
         const arr: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
+
         const raw: Mua[] = arr.map((x) => ({
           id: x.id,
           name: x.name,
           address: x.address,
           lat: Number(x.location_lat),
           lng: Number(x.location_lng),
-          photo: x.photo_url,
+          // >>> NORMALISASI FOTO PROFIL KE URL ABSOLUT
+          photo: resolvePhotoUrl(x.photo_url),
         }));
+
         const mmap: Record<string, Mua> = {};
         raw.forEach((m) => (mmap[m.id] = m));
         setMuaMap(mmap);
@@ -332,7 +351,11 @@ export default function UserDashboard() {
             {nearby.map((m, idx) => (
               <View key={m.id} style={[styles.nearCard, { marginLeft: idx === 0 ? 0 : 14 }]}>
                 <View style={{ flexDirection: "row", alignItems: "center" }}>
-                  <Image source={{ uri: m.photo }} style={styles.nearPhoto} />
+                  <Image
+                    source={{ uri: m.photo || PLACEHOLDER_AVATAR }}
+                    style={styles.nearPhoto}
+                    onError={() => { m.photo = PLACEHOLDER_AVATAR; }}
+                  />
                   <View style={{ marginLeft: 10, flex: 1 }}>
                     <Text style={styles.nearTitle} numberOfLines={1}>{m.name}</Text>
                     <Text style={styles.nearAddress} numberOfLines={2}>{m.address}</Text>
@@ -392,10 +415,8 @@ export default function UserDashboard() {
       <Section
         title="Temukan MUA"
         rightAction={
-          // Jika nanti ada screen list MUA khusus, arahkan ke sana (mis. "/(user)/mua")
           <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/(tabs)/mua")}>
             <Text style={styles.moreText}></Text>
-            {/* <Ionicons name="arrow-forward" size={14} color="#6B7280" /> */}
           </TouchableOpacity>
         }
         leftAction={
@@ -413,7 +434,11 @@ export default function UserDashboard() {
               onPress={() => router.push({ pathname: "/(user)/mua/[id]", params: { id: m.id } })}
               activeOpacity={0.8}
             >
-              <Image source={{ uri: m.photo }} style={styles.avatar} />
+              <Image
+                source={{ uri: m.photo || PLACEHOLDER_AVATAR }}
+                style={styles.avatar}
+                onError={() => { m.photo = PLACEHOLDER_AVATAR; }}
+              />
               <View style={{ flex: 1, marginLeft: 10 }}>
                 <Text style={styles.listTitle}>{m.name}</Text>
                 <Text style={styles.listAddress} numberOfLines={2}>{m.address}</Text>
@@ -430,7 +455,6 @@ export default function UserDashboard() {
       <Section
         title="Temukan Jasa"
         rightAction={
-          // >>> Perbaikan rute ke tab Offerings
           <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/(tabs)/offerings")}>
             <Text style={styles.moreText}>Lebih Banyak</Text>
             <Ionicons name="arrow-forward" size={14} color="#6B7280" />

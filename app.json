@@ -15,7 +15,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.smstudio.mua",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Lokasi dipakai untuk menampilkan MUA di sekitar Anda."
+        "NSLocationWhenInUseUsageDescription": "Lokasi dipakai untuk menampilkan MUA di sekitar Anda.",
+        "NSPhotoLibraryUsageDescription": "Aplikasi memerlukan akses foto untuk memilih/mengunggah gambar.",
+        "NSPhotoLibraryAddUsageDescription": "Aplikasi memerlukan izin untuk menyimpan gambar ke galeri (opsional)."
       }
     },
     "android": {
@@ -23,15 +25,25 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "permissions": ["ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"],
-  
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "READ_MEDIA_AUDIO",
+
+        "READ_EXTERNAL_STORAGE"
+      ],
       "package": "com.smstudio.mua"
     },
     "scheme": "smstudio",
     "plugins": [
       "expo-router",
       "expo-splash-screen",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-image-picker",
+      "expo-location"
     ]
   }
 }
