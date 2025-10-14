@@ -2,7 +2,7 @@
   "expo": {
     "name": "SM Studio",
     "slug": "mua-mobile",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/splash.jpg",
     "userInterfaceStyle": "light",
@@ -18,6 +18,9 @@
         "NSLocationWhenInUseUsageDescription": "Lokasi dipakai untuk menampilkan MUA di sekitar Anda.",
         "NSPhotoLibraryUsageDescription": "Aplikasi memerlukan akses foto untuk memilih/mengunggah gambar.",
         "NSPhotoLibraryAddUsageDescription": "Aplikasi memerlukan izin untuk menyimpan gambar ke galeri (opsional)."
+      },
+      "config": {
+        "googleMapsApiKey": "AIzaSyBVXajonAB7XCNtXIzEMNEZWoesn4b4ZVc"
       }
     },
     "android": {
@@ -26,15 +29,18 @@
         "backgroundColor": "#ffffff"
       },
       "permissions": [
-        "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION",
-
-        "READ_MEDIA_IMAGES",
-        "READ_MEDIA_VIDEO",
-        "READ_MEDIA_AUDIO",
-
-        "READ_EXTERNAL_STORAGE"
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE"
       ],
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyBVXajonAB7XCNtXIzEMNEZWoesn4b4ZVc"
+        }
+      },
       "package": "com.smstudio.mua"
     },
     "scheme": "smstudio",
@@ -44,6 +50,12 @@
       "expo-secure-store",
       "expo-image-picker",
       "expo-location"
-    ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "d247be69-b2ef-4092-bc95-dfc082ebc904"
+      }
+    }
   }
 }

@@ -7,28 +7,49 @@ import {
   ScrollView,
   ActivityIndicator,
   TouchableOpacity,
-  Alert,
   Platform,
   Share,
+  Linking,
+  Alert,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import * as Clipboard from "expo-clipboard";
 
-/* ================== Types ================== */
+/* ============== Debug & Console Helpers ============== */
+const DEBUG_ALERT = true; // set ke false saat production
+const LOG_NS = "[BookingInvoice]";
+
+function debugAlert(title: string, payload?: any) {
+  if (!DEBUG_ALERT) return;
+  let msg = "";
+  try {
+    if (payload == null) msg = "";
+    else if (typeof payload === "string") msg = payload;
+    else msg = JSON.stringify(payload, null, 2);
+  } catch {
+    msg = String(payload);
+  }
+  if (msg.length > 1200) msg = msg.slice(0, 1200) + "…(truncated)";
+  Alert.alert(`[DEBUG] ${title}`, msg || "(no details)");
+}
+function log(...args: any[]) { console.log(LOG_NS, ...args); }          // eslint-disable-line no-console
+function warn(...args: any[]) { console.warn(LOG_NS, ...args); }         // eslint-disable-line no-console
+function error(...args: any[]) { console.error(LOG_NS, ...args); }       // eslint-disable-line no-console
+
+/* ===================== Types ===================== */
 type Booking = {
-  id: number;
+  id: number | string;
   customer_id: string;
   mua_id: string;
-  offering_id?: number | null;
-  booking_date: string;     // ISO date/time string
-  booking_time: string;     // "HH:mm"
+  offering_id?: number | string | null;
+  booking_date: string;
+  booking_time: string;
   service_type: "home_service" | "studio";
   location_address?: string | null;
   notes?: string | null;
 
-  // invoice + pricing
   invoice_number?: string | null;
   invoice_date?: string | null;
   due_date?: string | null;
@@ -49,7 +70,7 @@ type Booking = {
 };
 
 type Offering = {
-  id: number;
+  id: number | string;
   name_offer: string;
   price?: string | number;
   makeup_type?: string | null;
@@ -59,9 +80,10 @@ type MuaLoc = {
   id: string;
   name: string;
   address?: string;
+  phone?: string | null;
 };
 
-/* ================== Consts ================== */
+/* ===================== Consts ===================== */
 const API_ORIGIN = "https://smstudio.my.id";
 const API_BASE = `${API_ORIGIN}/api`;
 const API_BOOKING = (id: string | number) => `${API_BASE}/bookings/${id}`;
@@ -72,7 +94,7 @@ const PURPLE = "#AA60C8";
 const MUTED = "#6B7280";
 const BORDER = "#E5E7EB";
 
-/* ================== Helpers ================== */
+/* ===================== Utils ===================== */
 const formatIDR = (n: number) =>
   `IDR ${new Intl.NumberFormat("id-ID").format(Math.round(n))}`;
 
@@ -125,10 +147,15 @@ async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Prom
 
   const ct = res.headers.get("content-type") || "";
   const text = await res.text();
+
   if (!res.ok) {
-    if (res.status === 401) throw new Error("401_UNAUTH");
+    if (res.status === 401) {
+      await SecureStore.deleteItemAsync("auth").catch(() => {});
+      throw new Error("401_UNAUTH");
+    }
     throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
   }
+
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -136,7 +163,19 @@ async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Prom
   }
 }
 
-/* ================== Screen ================== */
+/** Normalisasi nomor telepon ke +62xxxxxxxx */
+function normalizePhoneToID(pho?: string | null): string | null {
+  if (!pho) return null;
+  let s = String(pho).trim();
+  if (!s) return null;
+  s = s.replace(/[^\d+]/g, "");
+  if (s.startsWith("+")) return s;
+  if (s.startsWith("0")) return "+62" + s.slice(1);
+  if (s.startsWith("62")) return "+" + s;
+  return s.startsWith("+") ? s : `+${s}`;
+}
+
+/* ===================== Screen ===================== */
 export default function BookingInvoiceScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -145,49 +184,69 @@ export default function BookingInvoiceScreen() {
   const [offering, setOffering] = useState<Offering | null>(null);
   const [mua, setMua] = useState<MuaLoc | null>(null);
   const [loading, setLoading] = useState(true);
+  const [copied, setCopied] = useState(false);
 
-  // Fetch booking + (opsional) offering + nama MUA
   useEffect(() => {
     if (!id) return;
     (async () => {
+      const group = `${LOG_NS} fetch:${id}`;
+      console.groupCollapsed(group);
       try {
         setLoading(true);
         const headers = await getAuthHeaders();
+        log("headers ready", Object.keys(headers));
 
-        // booking
+        // Booking
         const bJson = await safeFetchJSON<{ data?: Booking } | Booking>(API_BOOKING(id), { headers });
         const bData: Booking = (bJson as any)?.data ?? (bJson as Booking);
         setBooking(bData);
+        log("booking loaded", { id: bData?.id, mua_id: bData?.mua_id, offering_id: bData?.offering_id });
 
-        // offering (untuk tampilkan nama jasa, harga awal)
+        // Offering (optional)
         if (bData?.offering_id) {
-          const oJson = await safeFetchJSON<{ data?: Offering } | Offering>(
-            API_OFFERING(bData.offering_id),
-            { headers }
-          );
-          setOffering((oJson as any)?.data ?? (oJson as Offering));
+          try {
+            const oJson = await safeFetchJSON<{ data?: Offering } | Offering>(
+              API_OFFERING(bData.offering_id),
+              { headers }
+            );
+            const oData = (oJson as any)?.data ?? (oJson as Offering);
+            setOffering(oData);
+            log("offering loaded", { id: oData?.id, name_offer: oData?.name_offer });
+          } catch (e: any) {
+            warn("offering fetch failed", e?.message || e);
+            setOffering(null);
+          }
+        } else {
+          log("no offering_id, skipping offering fetch");
         }
 
-        // nama/alamat MUA
-        const mJson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers });
-        const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
-        const found = list.find((m) => m.id === bData.mua_id) || null;
-        setMua(found);
+        // MUA list (ambil nama & phone)
+        try {
+          const mJson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers });
+          const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
+          const found = list.find((m) => m.id === bData.mua_id) || null;
+          setMua(found);
+          log("mua loaded", found ? { id: found.id, name: found.name, phone: found.phone } : "not found");
+        } catch (e: any) {
+          warn("mua fetch failed", e?.message || e);
+          setMua(null);
+        }
       } catch (e: any) {
+        error("fetch error", e?.message || e);
         if (e?.message === "401_UNAUTH") {
-          Alert.alert("Sesi berakhir", "Silakan login kembali.");
-          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          debugAlert("Auth expired / 401", { id, error: e?.message });
           router.replace("/(auth)/login");
         } else {
-          Alert.alert("Oops", e?.message || "Tidak bisa memuat invoice");
+          debugAlert("Load invoice gagal", { id, error: e?.message });
+          router.replace("/(user)/(tabs)/booking");
         }
       } finally {
         setLoading(false);
+        console.groupEnd();
       }
     })();
   }, [id, router]);
 
-  // Hitung total (fallback jika backend tidak kirim beberapa field)
   const computed = useMemo(() => {
     const amount = safeNum(booking?.amount ?? offering?.price, 0);
     const subtotal = safeNum(booking?.subtotal ?? amount, amount);
@@ -200,7 +259,6 @@ export default function BookingInvoiceScreen() {
     }
 
     const grand = safeNum(booking?.grand_total, subtotal - discount + taxAmount);
-
     return { amount, subtotal, discount, taxAmount, grand };
   }, [booking, offering]);
 
@@ -208,8 +266,57 @@ export default function BookingInvoiceScreen() {
     const s = (booking?.payment_status || "unpaid").toLowerCase();
     if (s === "paid") return "#16A34A";
     if (s === "refunded") return "#0EA5E9";
-    return "#F59E0B"; // unpaid/pending
+    return "#F59E0B";
   }, [booking]);
+
+  // WhatsApp CTA — sukses: buka WA, tanpa alert sukses
+  const onPressPesan = async () => {
+    const group = `${LOG_NS} wa:${booking?.id}`;
+    console.groupCollapsed(group);
+    try {
+      if (!mua) {
+        warn("MUA belum siap", { bookingId: booking?.id });
+        debugAlert("MUA belum siap", { bookingId: booking?.id });
+        return;
+      }
+      const intl = normalizePhoneToID(mua.phone || undefined);
+      if (!intl) {
+        warn("Nomor WA kosong/invalid", { phone: mua?.phone });
+        debugAlert("Nomor WA MUA kosong/invalid", { phone: mua?.phone });
+        return;
+      }
+
+      const title = offering?.name_offer || "Paket/Jasa";
+      const inv = booking?.invoice_number || `INV-${booking?.id}`;
+      const whenText = booking
+        ? `${fmtDate(booking.booking_date)} • ${booking.booking_time || "-"}`
+        : "-";
+
+      const text = encodeURIComponent(
+        `Halo ${mua.name}, saya ingin konfirmasi pemesanan.\n` +
+          `• Invoice: ${inv}\n` +
+          `• Layanan: ${title}\n` +
+          `• Jadwal: ${whenText}\n` +
+          `• Total: ${formatIDR(computed.grand)}\n\n` +
+          `Mohon info ketersediaannya. Terima kasih.`
+      );
+
+      const waUrl = `https://wa.me/${intl.replace("+", "")}?text=${text}`;
+      const canOpen = await Linking.canOpenURL(waUrl);
+      log("wa intent", { waUrl, canOpen });
+      if (canOpen) {
+        await Linking.openURL(waUrl);
+      } else {
+        warn("Tidak bisa open WhatsApp", { waUrl });
+        debugAlert("Tidak bisa membuka WhatsApp", { waUrl });
+      }
+    } catch (err: any) {
+      error("WA open error", err?.message || err);
+      debugAlert("Error saat open WhatsApp", err?.message || err);
+    } finally {
+      console.groupEnd();
+    }
+  };
 
   if (loading) {
     return (
@@ -220,30 +327,27 @@ export default function BookingInvoiceScreen() {
   }
 
   if (!booking) {
-    return (
-      <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <Text>Invoice tidak ditemukan.</Text>
-        <TouchableOpacity
-          style={[styles.btn, { marginTop: 10, backgroundColor: PURPLE }]}
-          onPress={() => router.replace("/(user)/index")}>
-          <Text style={{ color: "#fff", fontWeight: "700" }}>Kembali ke Beranda</Text>
-        </TouchableOpacity>
-      </View>
-    
-
-
-    );
+    debugAlert("Booking null setelah load", { id });
+    router.replace("/(user)/(tabs)/booking");
+    return null;
   }
 
   const title = offering?.name_offer || "Paket/Jasa";
   const inv = booking.invoice_number || `INV-${booking.id}`;
   const waktu = `${fmtDate(booking.booking_date)} • ${booking.booking_time || "-"}`;
+  const canMessage = !!normalizePhoneToID(mua?.phone || null);
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
       {/* Header mini */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.back} onPress={() => router.back()}>
+        <TouchableOpacity
+          style={styles.back}
+          onPress={() => {
+            log("back pressed");
+            router.back();
+          }}
+        >
           <Ionicons name="arrow-back" size={18} color="#111" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Invoice</Text>
@@ -264,10 +368,14 @@ export default function BookingInvoiceScreen() {
             style={[styles.iconBtn, { backgroundColor: "#F3F4F6" }]}
             onPress={async () => {
               try {
+                log("share pressed", { inv, title, total: computed.grand });
                 await Share.share({
                   message: `Invoice ${inv}\n${title}\nTotal ${formatIDR(computed.grand)}`,
                 });
-              } catch {}
+              } catch (err: any) {
+                error("share error", err?.message || err);
+                debugAlert("Share error", err?.message || err);
+              }
             }}
           >
             <Ionicons name="share-outline" size={18} color="#111" />
@@ -299,7 +407,7 @@ export default function BookingInvoiceScreen() {
         {booking.notes ? <Row label="Catatan" value={booking.notes} /> : null}
       </View>
 
-      {/* Ringkasan pembayaran */}
+      {/* Ringkasan pembayaran + CTA */}
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Ringkasan Pembayaran</Text>
 
@@ -309,40 +417,53 @@ export default function BookingInvoiceScreen() {
         <View style={[styles.divider, { marginVertical: 10 }]} />
         <Row label="Total" value={formatIDR(computed.grand)} bold />
 
-        {/* CTA */}
         <View style={{ marginTop: 16, gap: 10 }}>
+          {/* Copy tanpa Alert sukses */}
           <TouchableOpacity
             style={[styles.btn, { backgroundColor: PURPLE }]}
             onPress={async () => {
-              await Clipboard.setStringAsync(inv);
-              Alert.alert("Disalin", "Nomor invoice telah disalin.");
+              try {
+                log("copy invoice pressed", inv);
+                await Clipboard.setStringAsync(inv);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              } catch (err: any) {
+                error("copy invoice error", err?.message || err);
+                debugAlert("Copy invoice gagal", err?.message || err);
+              }
             }}
           >
             <Text style={{ color: "#fff", fontWeight: "800" }}>Salin No. Invoice</Text>
           </TouchableOpacity>
+          {copied ? <Text style={styles.copiedText}>Tersalin</Text> : null}
+
+          {/* Pesan Sekarang */}
+          <TouchableOpacity
+            style={[styles.btn, { backgroundColor: canMessage ? "#25D366" : "#C7C7C7" }]}
+            onPress={onPressPesan}
+            disabled={!canMessage}
+          >
+            <Text style={{ color: "#fff", fontWeight: "800" }}>
+              {canMessage ? "Pesan Sekarang (WhatsApp)" : "Nomor WA tidak tersedia"}
+            </Text>
+          </TouchableOpacity>
 
           <TouchableOpacity
             style={[styles.btn, { backgroundColor: "#F3F4F6" }]}
-            onPress={() => router.replace("/")}
+            onPress={() => {
+              log("back to list pressed");
+              router.replace("/(user)/(tabs)/booking");
+            }}
           >
-            <Text style={{ color: "#111827", fontWeight: "800" }}>Kembali ke Beranda</Text>
+            <Text style={{ color: "#111827", fontWeight: "800" }}>Kembali ke Pesanan</Text>
           </TouchableOpacity>
-        </View>
-
-        {/* Info pembayaran manual */}
-        <View style={styles.infoBox}>
-          <Ionicons name="information-circle-outline" size={18} color={PURPLE} />
-          <Text style={styles.infoText}>
-            Pembayaran dilakukan secara <Text style={{ fontWeight: "800" }}>manual</Text>. Ikuti petunjuk admin/MUA
-            dan kirim bukti transfer. Status akan berubah menjadi <Text style={{ fontWeight: "800" }}>PAID</Text> setelah diverifikasi.
-          </Text>
         </View>
       </View>
     </ScrollView>
   );
 }
 
-/* ============ Small row component ============ */
+/* ============== Small Row ============== */
 function Row({ label, value, bold = false }: { label: string; value: string; bold?: boolean }) {
   return (
     <View style={styles.rowBetween}>
@@ -354,7 +475,7 @@ function Row({ label, value, bold = false }: { label: string; value: string; bol
   );
 }
 
-/* ================== Styles ================== */
+/* ============== Styles ============== */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 8, android: 4 }) },
 
@@ -420,16 +541,12 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  infoBox: {
-    flexDirection: "row",
-    gap: 8,
-    alignItems: "flex-start",
-    padding: 12,
-    borderRadius: 10,
-    backgroundColor: "#F8F5FF",
-    borderWidth: 1,
-    borderColor: "#E9DDF7",
-    marginTop: 12,
+  copiedText: {
+    alignSelf: "center",
+    marginTop: -6,
+    marginBottom: 6,
+    fontSize: 12,
+    color: "#10B981",
+    fontWeight: "700",
   },
-  infoText: { color: "#4B5563", flex: 1, lineHeight: 18 },
 });

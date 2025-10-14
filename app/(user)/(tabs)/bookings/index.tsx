@@ -18,17 +18,18 @@ import { useRouter } from "expo-router";
 
 /* ================= Types ================= */
 type Booking = {
-  id: number;
-  offering_id?: number | null;
+  id: number | string;
+  offering_id?: number | string | null;
   booking_date?: string;   // ISO date or datetime
   booking_time?: string;   // "HH:MM"
   status?: string;
   mua_id?: string;
   offering?: { name_offer?: string } | null;
-  name_offer?: string;     // fallback if API flattens
+  name_offer?: string;     // fallback jika API flatten
   amount?: string | number;
   grand_total?: string | number;
   invoice_number?: string;
+  customer_id?: string | number; // <-- penting untuk filter milik user
 };
 
 type MuaLoc = {
@@ -40,8 +41,9 @@ type MuaLoc = {
 /* ================= Consts ================= */
 const API_ORIGIN = "https://smstudio.my.id";
 const API_BASE = `${API_ORIGIN}/api`;
-const API_BOOKINGS = `${API_BASE}/bookings`;     // server sebaiknya sudah filter by user
+const API_BOOKINGS = `${API_BASE}/bookings`; // server boleh sudah filter by auth user
 const API_MUA_LOC = `${API_BASE}/mua-location`;
+const API_ME = `${API_BASE}/me`;             // untuk ambil id user kalau belum tersimpan
 
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
@@ -61,6 +63,7 @@ async function getAuthToken(): Promise<string | null> {
     return null;
   }
 }
+
 async function getAuthHeaders(): Promise<HeaderMap> {
   const token = await getAuthToken();
   const h: HeaderMap = { Accept: "application/json" };
@@ -68,8 +71,29 @@ async function getAuthHeaders(): Promise<HeaderMap> {
   return h;
 }
 
+// Ambil me.id dari secure store; fallback panggil /api/me
+async function getMeId(): Promise<string | null> {
+  const raw = await SecureStore.getItemAsync("auth");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      const candidate =
+        parsed?.user?.id ?? parsed?.profile?.id ?? parsed?.id ?? null;
+      if (candidate) return String(candidate);
+    } catch {}
+  }
+  try {
+    const headers = await getAuthHeaders();
+    const me = await safeFetchJSON<any>(API_ME, { headers });
+    const id = me?.id ?? me?.user?.id ?? me?.profile?.id ?? null;
+    return id ? String(id) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
-  // gabungkan headers secara type-safe
+  // gabungkan headers
   const given = (init.headers || {}) as HeaderMap;
   const headers: HeadersInit = { ...given, Accept: "application/json" };
 
@@ -135,22 +159,41 @@ export default function ActiveBookingsScreen() {
     try {
       const headers = await getAuthHeaders();
 
-      // Ambil bookings user + peta MUA
+      // 1) Ambil ID user yang login
+      const meId = await getMeId();
+
+      // 2) Ambil bookings + peta MUA (sekali jalan)
       const [bJson, mJson] = await Promise.all([
         safeFetchJSON<{ data?: Booking[] } | Booking[]>(API_BOOKINGS, { headers }),
         safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers }),
       ]);
 
       const items: Booking[] = (bJson as any)?.data ?? (bJson as Booking[]) ?? [];
-      const actives = items.filter((b) =>
-        ["pending", "confirmed"].includes((b.status || "").toLowerCase())
-      );
 
+      // 3) Filter HANYA booking milik user
+      const mine = meId
+        ? items.filter((b) => {
+            const cid = b.customer_id != null ? String(b.customer_id) : null;
+            // jika API belum mengirim customer_id, kita **skip** (anggap bukan milik user)
+            return cid ? cid === meId : false;
+          })
+        : []; // jika tidak dapat meId, aman default kosong
+
+      // 4) (opsional) Urutkan terbaru dulu
+      mine.sort((a, b) => {
+        const da = parseDateTime(a);
+        const db = parseDateTime(b);
+        const ta = da ? +da : 0;
+        const tb = db ? +db : 0;
+        return tb - ta; // desc
+      });
+
+      // 5) Peta MUA
       const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
       const map: Record<string, MuaLoc> = {};
       for (const it of list) map[it.id] = it;
 
-      setRows(actives);
+      setRows(mine);
       setMuaMap(map);
     } catch (e: any) {
       if (e?.message === "401_UNAUTH") {
@@ -158,7 +201,7 @@ export default function ActiveBookingsScreen() {
         await SecureStore.deleteItemAsync("auth").catch(() => {});
         router.replace("/(auth)/login");
       } else {
-        // boleh log e?.message untuk debug
+        // bisa console.log(e) saat dev
         setRows([]);
       }
     } finally {
@@ -177,7 +220,7 @@ export default function ActiveBookingsScreen() {
     setRefreshing(false);
   }, [fetchAll]);
 
-  // search filter
+  // search filter (judul paket / nama MUA)
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return rows;
@@ -196,6 +239,7 @@ export default function ActiveBookingsScreen() {
     const title = item.offering?.name_offer || item.name_offer || "Paket";
     const vendor = (item.mua_id && muaMap[item.mua_id]?.name) || "SM Studio";
     const when = fmtHuman(parseDateTime(item));
+    const status = (item.status || "").toUpperCase();
 
     return (
       <TouchableOpacity
@@ -205,14 +249,21 @@ export default function ActiveBookingsScreen() {
       >
         <View style={{ flex: 1 }}>
           <Text style={styles.cardTitle} numberOfLines={1}>{title}</Text>
-          <Text style={styles.vendor}>{vendor}</Text>
-          <TouchableOpacity
-            style={styles.detailBtn}
-            onPress={() => router.push(`/(user)/bookings/${item.id}`)}
-          >
-            <Text style={{ color: "#9D61C5", fontWeight: "800" }}>Detail</Text>
-          </TouchableOpacity>
+          <Text style={styles.vendor} numberOfLines={1}>{vendor}</Text>
+
+          <View style={styles.rowMeta}>
+            <View style={styles.badge}>
+              <Text style={styles.badgeText}>{status || "STATUS"}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.detailBtn}
+              onPress={() => router.push(`/(user)/bookings/${item.id}`)}
+            >
+              <Text style={{ color: "#9D61C5", fontWeight: "800" }}>Detail</Text>
+            </TouchableOpacity>
+          </View>
         </View>
+
         <Text style={styles.when} numberOfLines={2}>{when}</Text>
       </TouchableOpacity>
     );
@@ -225,7 +276,7 @@ export default function ActiveBookingsScreen() {
       {/* Search */}
       <View style={styles.searchWrap}>
         <TextInput
-          placeholder="Search"
+          placeholder="Cari pesanan..."
           placeholderTextColor={TEXT_MUTED}
           style={styles.searchInput}
           value={query}
@@ -247,7 +298,7 @@ export default function ActiveBookingsScreen() {
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           ListEmptyComponent={
             <Text style={{ color: TEXT_MUTED, marginTop: 24, textAlign: "center" }}>
-              Belum ada pesanan aktif.
+              Belum ada pesanan.
             </Text>
           }
         />
@@ -258,9 +309,18 @@ export default function ActiveBookingsScreen() {
 
 /* ================= Styles ================= */
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 12, android: 8 }) },
-  title: { fontSize: 28, fontWeight: "800", marginHorizontal: 16, marginBottom: 12, color: "#111827" },
-
+  screen: {
+    flex: 1,
+    backgroundColor: "#fff",
+    paddingTop: Platform.select({ ios: 12, android: 8 }),
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: "800",
+    marginHorizontal: 16,
+    marginBottom: 12,
+    color: "#111827",
+  },
   searchWrap: {
     height: 44,
     marginHorizontal: 16,
@@ -273,7 +333,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   searchInput: { flex: 1, paddingHorizontal: 12, color: "#111" },
-
   card: {
     backgroundColor: CARD_BG,
     borderWidth: 1,
@@ -287,9 +346,21 @@ const styles = StyleSheet.create({
   cardTitle: { fontSize: 16, fontWeight: "800", color: "#111827" },
   vendor: { marginTop: 4, color: TEXT_MUTED },
   when: { marginLeft: 12, color: "#111827", textAlign: "right", width: 160 },
-  detailBtn: {
+  rowMeta: {
     marginTop: 10,
-    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  badge: {
+    backgroundColor: "#EBD8FF",
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+  },
+  badgeText: { color: "#6D3FA8", fontWeight: "700", fontSize: 12 },
+  detailBtn: {
+    marginLeft: 6,
     backgroundColor: "#EEE3FA",
     paddingVertical: 6,
     paddingHorizontal: 12,

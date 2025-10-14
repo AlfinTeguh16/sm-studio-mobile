@@ -22,26 +22,24 @@ type Offering = {
   id: string | number;
   mua_id: string;
   name_offer: string;
-  offer_pictures: string[] | null;
-  makeup_type?: string | null;
+  offer_pictures?: string[] | null;
+  makeup_type?: "bridal" | "party" | "photoshoot" | "graduation" | "sfx" | "" | null;
   person?: number | null;
   collaboration?: string | null;
   collaboration_price?: number | null;
   add_ons?: string[] | null;
-  price: number;
-  date?: string | null;
+  price?: number | string | null;
+  date?: string | null; // "YYYY-MM-DD"
 };
 
 type LocalImage = { uri: string; name: string; type: string };
 
-// util tanggal
 function toYMD(d: Date) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
     d.getDate()
   ).padStart(2, "0")}`;
 }
 
-// kompres ringan biar nyaman di backend
 async function compressImage(uri: string): Promise<LocalImage> {
   const out = await ImageManipulator.manipulateAsync(
     uri,
@@ -60,10 +58,9 @@ export default function OfferingEdit() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  // form states
   const [nameOffer, setNameOffer] = useState("");
-  const [makeupType, setMakeupType] = useState<
-    "bridal" | "party" | "photoshoot" | "graduation" | "sfx" | ""
-  >("");
+  const [makeupType, setMakeupType] = useState<Offering["makeup_type"]>("");
   const [person, setPerson] = useState(1);
 
   const [useDate, setUseDate] = useState(false);
@@ -71,12 +68,12 @@ export default function OfferingEdit() {
   const [showDatePicker, setShowDatePicker] = useState(false);
 
   const [priceStr, setPriceStr] = useState("");
-  const priceNum = useMemo(() => Number(priceStr.replace(/[^\d]/g, "")) || 0, [priceStr]);
+  const priceNum = useMemo(() => Number(String(priceStr).replace(/[^\d]/g, "")) || 0, [priceStr]);
 
   const [collabName, setCollabName] = useState("");
   const [collabPriceStr, setCollabPriceStr] = useState("");
   const collabPriceNum = useMemo(
-    () => (collabName.trim() ? Number(collabPriceStr.replace(/[^\d]/g, "")) || 0 : null),
+    () => (collabName.trim() ? Number(String(collabPriceStr).replace(/[^\d]/g, "")) || 0 : null),
     [collabName, collabPriceStr]
   );
 
@@ -85,11 +82,11 @@ export default function OfferingEdit() {
   const [addons, setAddons] = useState<string[]>([]);
   const [addonInput, setAddonInput] = useState("");
 
-  // ambil token
+  // token
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth").catch(() => null);
+        const raw = await SecureStore.getItemAsync("auth");
         if (raw) {
           const auth = JSON.parse(raw);
           if (auth?.token) setToken(auth.token);
@@ -98,32 +95,55 @@ export default function OfferingEdit() {
     })();
   }, []);
 
-  // GET data offering
+  // GET offering & PREFILL
   useEffect(() => {
     (async () => {
       if (!id) return;
       try {
         setLoading(true);
         const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}`, {
-          headers: { Accept: "application/json" },
+          headers: {
+            Accept: "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
         });
-        const j: Offering = await res.json();
-        if (!res.ok) throw new Error(j as any);
+        const raw = await res.text();
+        if (!res.ok) throw new Error(`HTTP ${res.status} — ${raw.slice(0, 200)}`);
 
-        setNameOffer(j.name_offer ?? "");
-        setMakeupType(((j.makeup_type || "") as any) as typeof makeupType);
-        setPerson(j.person || 1);
-        setPriceStr(String(Math.round(j.price ?? 0)));
-        setCollabName(j.collaboration || "");
-        setCollabPriceStr(String(Math.round(j.collaboration_price || 0) || ""));
-        setServerPhotos(Array.isArray(j.offer_pictures) ? j.offer_pictures : []);
-        setAddons(Array.isArray(j.add_ons) ? j.add_ons : []);
+        let j: any;
+        try { j = JSON.parse(raw); } catch { j = {}; }
+        const data: Offering = j?.data ?? j;
 
-        if (j.date) {
-          const [Y, M, D] = j.date.split("-").map(Number);
+        // PREFILL aman null/undefined
+        setNameOffer(String(data?.name_offer ?? ""));
+        setMakeupType((data?.makeup_type as any) || "");
+        setPerson(Number(data?.person ?? 1));
+
+        // harga → string angka
+        const priceRaw = data?.price ?? 0;
+        setPriceStr(String(Math.round(Number(priceRaw) || 0)));
+
+        // kolab
+        setCollabName(String(data?.collaboration ?? ""));
+        setCollabPriceStr(
+          data?.collaboration ? String(Math.round(Number(data?.collaboration_price ?? 0))) : ""
+        );
+
+        // foto server
+        const pics = Array.isArray(data?.offer_pictures) ? data!.offer_pictures! : [];
+        setServerPhotos(pics);
+
+        // add-ons
+        setAddons(Array.isArray(data?.add_ons) ? (data!.add_ons as string[]) : []);
+
+        // tanggal
+        if (data?.date) {
+          const [Y, M, D] = String(data.date).split("-").map((n) => Number(n));
           if (Y && M && D) {
             setUseDate(true);
             setDate(new Date(Y, M - 1, D));
+          } else {
+            setUseDate(false);
           }
         } else {
           setUseDate(false);
@@ -134,9 +154,9 @@ export default function OfferingEdit() {
         setLoading(false);
       }
     })();
-  }, [id]);
+  }, [id, token]);
 
-  // pilih gambar (akan ikut dikirim saat Simpan)
+  // pilih gambar lokal
   const pickImages = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -151,27 +171,25 @@ export default function OfferingEdit() {
     });
     if (result.canceled) return;
 
-    const mapped: LocalImage[] = (result.assets || [])
-      .slice(0, 10)
-      .map((a, i) => {
-        const name =
-          a.fileName ||
-          `photo_${Date.now()}_${i}.${(a.uri.split(".").pop() || "jpg").replace(/\?.*$/, "")}`;
-        const type =
-          a.mimeType ||
-          (name.toLowerCase().endsWith(".png")
-            ? "image/png"
-            : name.toLowerCase().endsWith(".webp")
-            ? "image/webp"
-            : "image/jpeg");
-        return { uri: a.uri, name, type };
-      });
+    const mapped: LocalImage[] = (result.assets || []).slice(0, 10).map((a, i) => {
+      const name =
+        a.fileName ||
+        `photo_${Date.now()}_${i}.${(a.uri.split(".").pop() || "jpg").replace(/\?.*$/, "")}`;
+      const type =
+        a.mimeType ||
+        (name.toLowerCase().endsWith(".png")
+          ? "image/png"
+          : name.toLowerCase().endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg");
+      return { uri: a.uri, name, type };
+    });
     setLocalImages((prev) => [...prev, ...mapped].slice(0, 50));
   }, []);
   const removeLocalImage = (idx: number) =>
     setLocalImages((prev) => prev.filter((_, i) => i !== idx));
 
-  // hapus 1 foto lama di server
+  // hapus foto lama di server
   async function deleteServerPictureByIndex(idx: number) {
     try {
       if (!token) throw new Error("Harap login.");
@@ -182,25 +200,22 @@ export default function OfferingEdit() {
       (fd as any).append("index", String(idx));
       (fd as any).append("also_delete_files", "1");
 
-      const res = await fetch(
-        `${API}/offerings/${encodeURIComponent(String(id))}/pictures`,
-        {
-          method: "POST",
-          headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-          body: fd as any, // JANGAN set Content-Type manual
-        }
-      );
+      const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}/pictures`, {
+        method: "POST",
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+        body: fd as any,
+      });
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.message || j?.error || "Gagal menghapus foto.");
-      const updated: Offering = j;
-      setServerPhotos(Array.isArray(updated.offer_pictures) ? updated.offer_pictures : []);
+      const updated: Offering = j?.data ?? j;
+      setServerPhotos(Array.isArray(updated?.offer_pictures) ? (updated!.offer_pictures as string[]) : []);
       Alert.alert("Berhasil", "Foto dihapus.");
     } catch (e: any) {
       Alert.alert("Gagal", e?.message || "Tidak bisa menghapus foto.");
     }
   }
 
-  // add-ons sederhana
+  // add-ons
   function addAddon() {
     const v = addonInput.trim();
     if (!v) return;
@@ -211,7 +226,7 @@ export default function OfferingEdit() {
     setAddons((prev) => prev.filter((x) => x !== v));
   }
 
-  // SIMPAN PERUBAHAN: kirim field + file sekaligus
+  // SIMPAN
   async function saveAll() {
     try {
       if (!token) throw new Error("Harap login.");
@@ -224,9 +239,8 @@ export default function OfferingEdit() {
 
       setSaving(true);
 
-      // multipart
       const fd = new FormData();
-      (fd as any).append("_method", "PATCH"); // penting utk Laravel
+      (fd as any).append("_method", "PATCH");
       (fd as any).append("name_offer", nameOffer.trim());
       (fd as any).append("makeup_type", makeupType || "");
       (fd as any).append("person", String(person));
@@ -239,7 +253,6 @@ export default function OfferingEdit() {
 
       addons.forEach((a) => (fd as any).append("add_ons[]", a));
 
-      // kompres & lampirkan file baru (kalau ada)
       for (const f of localImages) {
         const c = await compressImage(f.uri);
         (fd as any).append("offer_images[]", {
@@ -250,16 +263,16 @@ export default function OfferingEdit() {
       }
 
       const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}`, {
-        method: "POST", // POST + _method=PATCH
+        method: "POST",
         headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-        body: fd as any, // ❗JANGAN set Content-Type manual
+        body: fd as any,
       });
 
-      const j: Offering = await res.json().catch(() => ({} as any));
-      if (!res.ok) throw new Error((j as any)?.message || (j as any)?.error || "Gagal menyimpan perubahan.");
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.message || j?.error || "Gagal menyimpan perubahan.");
 
-      // refresh state dari response server
-      setServerPhotos(Array.isArray(j.offer_pictures) ? j.offer_pictures : []);
+      const updated: Offering = j?.data ?? j;
+      setServerPhotos(Array.isArray(updated?.offer_pictures) ? (updated!.offer_pictures as string[]) : []);
       setLocalImages([]);
       Alert.alert("Sukses", "Perubahan disimpan.", [{ text: "OK", onPress: () => router.back() }]);
     } catch (e: any) {
@@ -290,7 +303,7 @@ export default function OfferingEdit() {
           <View style={{ width: 40 }} />
         </View>
 
-        {/* Card */}
+        {/* Card Form */}
         <View style={styles.card}>
           {/* Nama Paket */}
           <Text style={styles.label}>Nama Paket *</Text>
@@ -308,7 +321,7 @@ export default function OfferingEdit() {
             {(["bridal", "party", "photoshoot", "graduation", "sfx"] as const).map((t) => (
               <TouchableOpacity
                 key={t}
-                onPress={() => setMakeupType(t === makeupType ? "" : t)}
+                onPress={() => setMakeupType(makeupType === t ? "" : t)}
                 style={[styles.segment, makeupType === t && { backgroundColor: PURPLE, borderColor: PURPLE }]}
               >
                 <Text style={[styles.segmentText, makeupType === t && { color: "#fff", fontWeight: "800" }]}>
@@ -403,28 +416,31 @@ export default function OfferingEdit() {
           <Text style={[styles.label, { marginTop: 14 }]}>Foto Saat Ini</Text>
           {serverPhotos.length > 0 ? (
             <View style={{ gap: 10 }}>
-              {serverPhotos.map((p, idx) => (
-                <View key={`${p}-${idx}`}>
-                  <Image
-                    source={{ uri: p.startsWith("/storage/") ? `${BASE}${p}` : p }}
-                    style={{ width: "100%", height: 180, borderRadius: 10, backgroundColor: "#f3f4f6" }}
-                  />
-                  <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 6 }}>
-                    <TouchableOpacity
-                      onPress={() => deleteServerPictureByIndex(idx)}
-                      style={[styles.iconBtn, { backgroundColor: "#fee2e2" }]}
-                    >
-                      <Ionicons name="trash" size={16} color="#dc2626" />
-                    </TouchableOpacity>
+              {serverPhotos.map((p, idx) => {
+                const uri = p?.startsWith("/storage/") ? `${BASE}${p}` : p;
+                return (
+                  <View key={`${p}-${idx}`}>
+                    <Image
+                      source={{ uri }}
+                      style={{ width: "100%", height: 180, borderRadius: 10, backgroundColor: "#f3f4f6" }}
+                    />
+                    <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 6 }}>
+                      <TouchableOpacity
+                        onPress={() => deleteServerPictureByIndex(idx)}
+                        style={[styles.iconBtn, { backgroundColor: "#fee2e2" }]}
+                      >
+                        <Ionicons name="trash" size={16} color="#dc2626" />
+                      </TouchableOpacity>
+                    </View>
                   </View>
-                </View>
-              ))}
+                );
+              })}
             </View>
           ) : (
             <Text style={{ color: TEXT_MUTED, marginTop: 6 }}>Belum ada foto.</Text>
           )}
 
-          {/* Tambah foto baru (ikut terkirim saat Simpan) */}
+          {/* Tambah foto baru */}
           <Text style={[styles.label, { marginTop: 14 }]}>Tambah Foto</Text>
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
             <TouchableOpacity onPress={pickImages} style={styles.addLineBtn}>
@@ -447,7 +463,7 @@ export default function OfferingEdit() {
             <Text style={{ color: TEXT_MUTED, marginTop: 6 }}>Belum ada foto baru.</Text>
           )}
 
-          {/* Add-ons (opsional UI sederhana) */}
+          {/* Add-ons */}
           <Text style={[styles.label, { marginTop: 14 }]}>Add-ons</Text>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <TextInput

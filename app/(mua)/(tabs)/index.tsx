@@ -529,7 +529,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     flexDirection: "row",
   },
-  portPhoto: { width: 140, height: 120, backgroundColor: "#eee" },
+  portPhoto: { width: 140, height: "100%", backgroundColor: "#eee" },
   portTitle: { fontSize: 16, fontWeight: "800", color: "#111827" },
   metaLabel: { color: MUTED, marginTop: 6 },
   metaValue: { color: "#111827" },

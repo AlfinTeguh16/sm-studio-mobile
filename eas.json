@@ -1,0 +1,21 @@
+{
+    "cli": { "version": ">= 5.8.0" },
+    "build": {
+      "preview-apk": {
+        "android": { "buildType": "apk" }
+      },
+      "production": {
+        "android": {
+          "buildType": "app-bundle"  
+        }
+      }
+    },
+    "submit": {
+        "production": {
+          "android": {
+            "track": "internal"         // internal / alpha / beta / production
+          }
+        }
+      }
+  }
+  

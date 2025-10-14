@@ -12,14 +12,18 @@ import DateTimePicker from "@react-native-community/datetimepicker";
 /* ========= Types ========= */
 type Offering = {
   id: number;
-  mua_id: string;
+  mua_id: string; // << harus UUID
   name_offer: string;
   offer_pictures?: string[];
   price?: string | number;
   makeup_type?: string | null;
 };
 
-type Me = { id?: string; name?: string; profile?: { id?: string; name?: string } };
+type Me = {
+  id?: string | number; // biasanya angka (user id)
+  profile?: { id?: string; name?: string }; // << UUID di sini
+  name?: string;
+};
 
 /* ========= Const ========= */
 const API_BASE = "https://smstudio.my.id/api";
@@ -37,12 +41,93 @@ const formatIDR = (n: number) =>
   `IDR ${new Intl.NumberFormat("id-ID").format(Math.round(isFinite(n) ? n : 0))}`;
 
 const ymd = (d: Date) =>
-  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-    d.getDate()
-  ).padStart(2, "0")}`;
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
 const hm = (d: Date) =>
   `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+
+const uuidRe =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function getTokenAndCustomerUUID(): Promise<{ token: string | null; customerUUID: string | null }> {
+  let token: string | null = null;
+  let customerUUID: string | null = null;
+
+  // Ambil dari SecureStore (jaga-jaga)
+  const raw = await SecureStore.getItemAsync("auth");
+  if (raw) {
+    try {
+      const auth = JSON.parse(raw);
+      token = auth?.token ?? null;
+      // coba ambil profile.id (uuid)
+      const maybeProfile = auth?.profile?.id || auth?.user?.profile?.id;
+      if (maybeProfile && uuidRe.test(String(maybeProfile))) {
+        customerUUID = String(maybeProfile);
+      }
+    } catch {}
+  }
+
+  // GET /auth/me untuk konfirmasi profile.id
+  try {
+    const res = await fetch(API_ME, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+    if (res.ok) {
+      const me: Me = await res.json();
+      const profId = me?.profile?.id;
+      if (profId && uuidRe.test(String(profId))) {
+        customerUUID = String(profId);
+      }
+    }
+  } catch {}
+
+  return { token, customerUUID };
+}
+
+/** POST with verbose logging + extract error detail dari Laravel */
+async function postJSONLogged<T = any>(url: string, headers: Record<string, string>, body: any): Promise<T> {
+  const group = `[POST] ${url}`;
+  console.groupCollapsed(group);
+  console.log("headers", headers);
+  console.log("body", body);
+  console.groupEnd();
+
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const ct = res.headers.get("content-type") || "";
+  const raw = await res.text();
+
+  console.groupCollapsed(`[POST-res] ${url} -> ${res.status}`);
+  console.log("content-type", ct);
+  console.log("raw", raw);
+  console.groupEnd();
+
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    let details = "";
+    try {
+      if (ct.includes("json")) {
+        const j = JSON.parse(raw);
+        msg = j.message || j.error || msg;
+        if (j.errors && typeof j.errors === "object") {
+          details = Object.entries(j.errors)
+            .map(([k, v]) => `${k}: ${(v as any[]).join(", ")}`)
+            .join("\n");
+        }
+      } else {
+        details = raw.slice(0, 800);
+      }
+    } catch {
+      details = raw.slice(0, 800);
+    }
+    throw new Error([msg, details].filter(Boolean).join("\n"));
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return raw as unknown as T;
+  }
+}
 
 /* ========= Screen ========= */
 export default function BookingCreateScreen() {
@@ -51,14 +136,14 @@ export default function BookingCreateScreen() {
 
   // auth + me
   const [token, setToken] = useState<string | null>(null);
-  const [customerId, setCustomerId] = useState<string | null>(null);
+  const [customerId, setCustomerId] = useState<string | null>(null); // << harus UUID
 
   // offering
   const [item, setItem] = useState<Offering | null>(null);
   const [loading, setLoading] = useState(true);
 
   // form
-  const [person, setPerson] = useState(1); // <— jumlah orang, DIKIRIM sebagai `person`
+  const [person, setPerson] = useState(1);
   const [serviceType, setServiceType] = useState<"home_service" | "studio">("home_service");
   const [address, setAddress] = useState("");
   const [notes, setNotes] = useState("");
@@ -78,32 +163,16 @@ export default function BookingCreateScreen() {
   const taxAmount = useMemo(() => (subTotal * TAX_PERCENT) / 100, [subTotal]);
   const grandTotal = useMemo(() => subTotal + taxAmount, [subTotal, taxAmount]);
 
-  // token + me
+  // token + me (pastikan customerId = UUID)
   useEffect(() => {
     (async () => {
-      try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
-          const id = auth?.user?.id || auth?.profile?.id;
-          if (id) setCustomerId(String(id));
-        }
-      } catch {}
-      try {
-        const res = await fetch(API_ME, {
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        });
-        if (res.ok) {
-          const me: Me = await res.json();
-          const id = me?.id || me?.profile?.id;
-          if (id) setCustomerId(String(id));
-        }
-      } catch {}
+      const { token: tk, customerUUID } = await getTokenAndCustomerUUID();
+      if (tk) setToken(tk);
+      if (customerUUID) setCustomerId(customerUUID);
     })();
-  }, [token]);
+  }, []);
 
-  // GET offering (pakai token kalau endpoint butuh auth)
+  // GET offering
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -116,7 +185,7 @@ export default function BookingCreateScreen() {
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
         });
-        const json = await res.json();
+        const json = await res.json().catch(() => ({}));
         const data: Offering = json?.data ?? json;
         if (mounted) setItem(data);
       } catch (e: any) {
@@ -134,71 +203,74 @@ export default function BookingCreateScreen() {
   async function submit() {
     try {
       if (!item) throw new Error("Offering tidak ditemukan");
-      if (!customerId) throw new Error("Akun belum dikenali, silakan login ulang");
+      if (!customerId || !uuidRe.test(customerId)) {
+        throw new Error("Akun belum dikenali (customer_id bukan UUID). Silakan login ulang.");
+      }
+      if (!uuidRe.test(item.mua_id)) {
+        throw new Error("Data MUA tidak valid (mua_id bukan UUID).");
+      }
       if (serviceType === "home_service" && !address.trim()) {
         throw new Error("Alamat wajib diisi untuk Home Service.");
       }
 
-      const payload = {
-        customer_id: customerId,
-        mua_id: item.mua_id,
-        offering_id: item.id,
-        booking_date: ymd(date),
-        booking_time: hm(date),
+      // tanggal invoice = hari ini; due_date minimal sama dengan invoice_date (aman)
+      const today = new Date();
+      const payload: any = {
+        customer_id: customerId,           // UUID
+        mua_id: item.mua_id,               // UUID
+        offering_id: Number(item.id),      // integer
+        booking_date: ymd(date),           // YYYY-MM-DD
+        booking_time: hm(date),            // HH:mm
+        person: Math.max(1, person),
         service_type: serviceType,
         location_address: serviceType === "home_service" ? address : null,
         notes: notes || null,
 
-        // tambahan baru
-        person: Math.max(1, person),
-
-        // invoice meta (opsional)
-        invoice_date: ymd(new Date()),
-        due_date: ymd(date),
+        // invoice meta
+        invoice_date: ymd(today),
+        due_date: ymd(date),               // >= invoice_date
 
         // pricing
-        amount: subTotal,           // harga x person
-        selected_add_ons: [],
-        discount_amount: 0,
-        tax: TAX_PERCENT,           // persen
+        amount: Number(subTotal),
+        // selected_add_ons: [],           // HAPUS kalau kosong (lihat di bawah)
+        // discount_amount: 0,             // HAPUS kalau nol—biar backend yang default
+        tax: TAX_PERCENT,                  // persen
 
-        // pembayaran manual
         payment_method: "manual",
       };
 
-      const res = await fetch(API_BOOKINGS, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify(payload),
+      // Hapus field yang kosong/zero agar validasi tidak salah paham
+      Object.keys(payload).forEach((k) => {
+        if (
+          payload[k] === undefined ||
+          payload[k] === "" ||
+          payload[k] === null ||
+          (Array.isArray(payload[k]) && payload[k].length === 0)
+        ) {
+          delete payload[k];
+        }
       });
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data?.message || data?.error || "Gagal membuat booking. Pastikan data sudah benar.");
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      };
+
+      const result = await postJSONLogged<{ data?: { id: number | string } }>(API_BOOKINGS, headers, payload);
+
+      // Ambil ID booking dari response Laravel ({ data: {...} })
+      const bookingId = result?.data?.id ?? (result as any)?.id;
+      if (!bookingId) {
+        console.error("[CreateBooking] Missing booking id in response:", result);
+        Alert.alert("Gagal", "Server tidak mengembalikan ID booking.");
+        return;
       }
 
-      Alert.alert(
-        "Berhasil",
-        `Pesanan dibuat.\nNomor Invoice: ${data?.invoice_number || "-"}\nTotal: ${formatIDR(
-          Number(data?.grand_total ?? grandTotal)
-        )}`,
-        [
-          {
-            text: "Lihat Invoice",
-            onPress: () => {
-              // arahkan ke halaman invoice/bookings detail
-              const id = String(data?.id ?? "");
-              if (id) router.replace({ pathname: "/(user)/bookings/[id]", params: { id } });
-            },
-          },
-        ]
-      );
+      // SUKSES → langsung ke invoice
+      router.replace(`/(user)/bookings/${bookingId}`);
     } catch (e: any) {
-      Alert.alert("Gagal", e?.message || "Tidak bisa mengirim booking.");
+      Alert.alert("Gagal", e?.message || "Maaf jadwal mua sudah penuh.");
     }
   }
 
@@ -243,10 +315,7 @@ export default function BookingCreateScreen() {
         <View style={styles.rowBetween}>
           <Text style={styles.formLabel}>Jumlah Orang</Text>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-            <TouchableOpacity
-              style={styles.stepper}
-              onPress={() => setPerson((v) => Math.max(1, v - 1))}
-            >
+            <TouchableOpacity style={styles.stepper} onPress={() => setPerson((v) => Math.max(1, v - 1))}>
               <Ionicons name="remove" size={16} color="#fff" />
             </TouchableOpacity>
             <Text style={{ fontWeight: "700" }}>{person}</Text>
@@ -265,10 +334,7 @@ export default function BookingCreateScreen() {
               { day: "2-digit", month: "long", year: "numeric" }
             )}`}
           </Text>
-          <TouchableOpacity
-            style={styles.dateBtn}
-            onPress={() => setShowPicker(showPicker ? null : "date")}
-          >
+          <TouchableOpacity style={styles.dateBtn} onPress={() => setShowPicker(showPicker ? null : "date")}>
             <Text style={{ fontWeight: "700" }}>Tanggal</Text>
           </TouchableOpacity>
         </View>
@@ -303,17 +369,9 @@ export default function BookingCreateScreen() {
             <TouchableOpacity
               key={t}
               onPress={() => setServiceType(t)}
-              style={[
-                styles.segment,
-                serviceType === t && { backgroundColor: PURPLE, borderColor: PURPLE },
-              ]}
+              style={[styles.segment, serviceType === t && { backgroundColor: PURPLE, borderColor: PURPLE }]}
             >
-              <Text
-                style={[
-                  styles.segmentText,
-                  serviceType === t && { color: "#fff", fontWeight: "800" },
-                ]}
-              >
+              <Text style={[styles.segmentText, serviceType === t && { color: "#fff", fontWeight: "800" }]}>
                 {t === "home_service" ? "Home Service" : "Studio"}
               </Text>
             </TouchableOpacity>

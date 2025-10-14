@@ -13,11 +13,10 @@ import {
   Easing,
   Pressable,
   ActivityIndicator,
-  Alert,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
-import MapView, { Marker } from "react-native-maps";
+import MapView, { Marker, Region } from "react-native-maps";
 import * as SecureStore from "expo-secure-store";
 import { useRouter } from "expo-router";
 
@@ -25,8 +24,8 @@ import { useRouter } from "expo-router";
 type MuaApi = {
   id: string;
   name: string;
-  location_lat: string;
-  location_lng: string;
+  location_lat: string | number | null;
+  location_lng: string | number | null;
   address: string;
   photo_url: string | null;
 };
@@ -36,11 +35,11 @@ type Mua = {
   address: string;
   lat: number;
   lng: number;
-  photo: string;          // sudah dinormalisasi jadi URL absolut / placeholder
+  photo: string; // URL absolut / placeholder
   distanceKm?: number;
 };
 type OfferingApi = {
-  id: number;
+  id: number | string;
   mua_id: string;
   name_offer: string;
   price?: string | number;
@@ -67,9 +66,9 @@ const PLACEHOLDER_AVATAR = "https://via.placeholder.com/96x96.png?text=MUA";
 type HeaderMap = Record<string, string>;
 
 async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
   try {
+    const raw = await SecureStore.getItemAsync("auth");
+    if (!raw) return null;
     const parsed = JSON.parse(raw);
     return typeof parsed?.token === "string" ? parsed.token : null;
   } catch {
@@ -92,15 +91,22 @@ async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Prom
     if (res.status === 401) throw new Error("401_UNAUTH");
     throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
   }
-  try { return JSON.parse(text) as T; }
-  catch { throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`); }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+  }
 }
 
+function toNumber(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   const R = 6371;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
+  const dLon = toRad(lat2 - lon1);
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
@@ -115,7 +121,12 @@ function safeNum(v: any): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 function formatIDR(v: number) {
-  return new Intl.NumberFormat("id-ID").format(v);
+  // Fallback aman jika Intl tidak tersedia di runtime tertentu
+  try {
+    return new Intl.NumberFormat("id-ID").format(v);
+  } catch {
+    return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  }
 }
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return Promise.race<T>([
@@ -123,23 +134,15 @@ function withTimeout<T>(p: Promise<T>, ms: number) {
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error("Location timeout")), ms)),
   ]);
 }
-
-/** Pastikan foto_url jadi URL absolut ke domain, mendukung:
- *  - "https://..." → kembalikan apa adanya
- *  - "/storage/profile_photos/xxx.jpg" → prepend API_ORIGIN
- *  - "storage/profile_photos/xxx.jpg" → prepend API_ORIGIN + "/"
- *  - nilai kosong/null → placeholder
- */
+/** Normalisasi foto_url ke URL absolut (atau placeholder) */
 function resolvePhotoUrl(u?: string | null): string {
   if (!u) return PLACEHOLDER_AVATAR;
   const s = String(u);
   if (s.startsWith("http://") || s.startsWith("https://")) return s;
   if (s.startsWith("/")) return `${API_ORIGIN}${s}`;
   if (s.startsWith("storage/")) return `${API_ORIGIN}/${s}`;
-  // fallback lain tetap coba absolutkan
   return `${API_ORIGIN}/${s.replace(/^\/+/, "")}`;
 }
-
 async function getSafeUserCoords(): Promise<{ lat: number; lng: number } | null> {
   try {
     const enabled = await Location.hasServicesEnabledAsync();
@@ -158,10 +161,43 @@ async function getSafeUserCoords(): Promise<{ lat: number; lng: number } | null>
     return null;
   }
 }
+/** Region aman untuk MapView (hindari NaN) */
+function makeSafeRegion(lat: number, lng: number): Region {
+  const latOk = Number.isFinite(lat) ? lat : -6.2;
+  const lngOk = Number.isFinite(lng) ? lng : 106.8;
+  return {
+    latitude: latOk,
+    longitude: lngOk,
+    latitudeDelta: 0.25,
+    longitudeDelta: 0.25,
+  };
+}
+
+/** Gambar dengan fallback aman (tanpa mutasi objek MUA) */
+function Img({
+  uri,
+  style,
+  fallback = PLACEHOLDER_AVATAR,
+}: {
+  uri?: string | null;
+  style: any;
+  fallback?: string;
+}) {
+  const [ok, setOk] = useState(true);
+  const src = useMemo(() => (ok && uri ? { uri } : { uri: fallback }), [ok, uri, fallback]);
+  return <Image source={src} style={style} onError={() => setOk(false)} />;
+}
 
 /* ======================= Screen ======================= */
 export default function UserDashboard() {
   const router = useRouter();
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Greeting
   const [displayName, setDisplayName] = useState<string>("");
@@ -204,7 +240,7 @@ export default function UserDashboard() {
         if (authStr) {
           const auth = JSON.parse(authStr || "{}");
           const nm = auth?.user?.name || auth?.profile?.name;
-          if (nm) {
+          if (nm && mountedRef.current) {
             setDisplayName(String(nm));
             return;
           }
@@ -213,7 +249,7 @@ export default function UserDashboard() {
               headers: { Authorization: `Bearer ${auth.token}` },
             });
             const n2 = me?.name || me?.profile?.name;
-            if (n2) {
+            if (n2 && mountedRef.current) {
               setDisplayName(String(n2));
               return;
             }
@@ -224,13 +260,14 @@ export default function UserDashboard() {
         const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_NEARBY);
         const list: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
         const first = list[0];
-        if (first?.name) setDisplayName(String(first.name));
+        if (first?.name && mountedRef.current) setDisplayName(String(first.name));
       } catch {}
     })();
   }, []);
 
   /* --- Fetch MUA + lokasi aman + validasi jarak --- */
   useEffect(() => {
+    let alive = true;
     (async () => {
       setNearbyLoading(true);
       try {
@@ -238,19 +275,26 @@ export default function UserDashboard() {
         const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_NEARBY, { headers });
         const arr: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
 
-        const raw: Mua[] = arr.map((x) => ({
-          id: x.id,
-          name: x.name,
-          address: x.address,
-          lat: Number(x.location_lat),
-          lng: Number(x.location_lng),
-          // >>> NORMALISASI FOTO PROFIL KE URL ABSOLUT
-          photo: resolvePhotoUrl(x.photo_url),
-        }));
+        // Map + filter hanya yang punya koordinat valid
+        const raw: Mua[] = arr
+          .map((x) => {
+            const lat = toNumber(x.location_lat);
+            const lng = toNumber(x.location_lng);
+            if (lat == null || lng == null) return null;
+            return {
+              id: String(x.id),
+              name: x.name || "MUA",
+              address: x.address || "-",
+              lat,
+              lng,
+              photo: resolvePhotoUrl(x.photo_url),
+            } as Mua;
+          })
+          .filter(Boolean) as Mua[];
 
         const mmap: Record<string, Mua> = {};
         raw.forEach((m) => (mmap[m.id] = m));
-        setMuaMap(mmap);
+        if (alive && mountedRef.current) setMuaMap(mmap);
 
         let coords = await getSafeUserCoords();
         if (coords) {
@@ -258,7 +302,7 @@ export default function UserDashboard() {
           const minKm = Math.min(...distances);
           if (!Number.isFinite(minKm) || minKm > 3000) coords = null;
         }
-        setUserCoords(coords ?? null);
+        if (alive && mountedRef.current) setUserCoords(coords ?? null);
 
         const rows = coords
           ? raw
@@ -266,20 +310,21 @@ export default function UserDashboard() {
               .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity))
           : raw;
 
-        setNearby(rows);
-      } catch (e: any) {
-        if (e?.message === "401_UNAUTH") {
-          Alert.alert("Sesi berakhir", "Silakan login kembali.");
-        }
-        setNearby([]);
+        if (alive && mountedRef.current) setNearby(rows);
+      } catch {
+        if (alive && mountedRef.current) setNearby([]);
       } finally {
-        setNearbyLoading(false);
+        if (alive && mountedRef.current) setNearbyLoading(false);
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   /* --- Fetch offerings (gabungkan nama MUA dari muaMap jika ada) --- */
   useEffect(() => {
+    let alive = true;
     (async () => {
       setOfferingsLoading(true);
       try {
@@ -293,17 +338,17 @@ export default function UserDashboard() {
           price: safeNum(x.price),
           category: x.makeup_type ?? undefined,
         }));
-        setOfferings(items);
-      } catch (e: any) {
-        if (e?.message === "401_UNAUTH") {
-          Alert.alert("Sesi berakhir", "Silakan login kembali.");
-        }
-        setOfferings([]);
+        if (alive && mountedRef.current) setOfferings(items);
+      } catch {
+        if (alive && mountedRef.current) setOfferings([]);
       } finally {
-        setOfferingsLoading(false);
+        if (alive && mountedRef.current) setOfferingsLoading(false);
       }
     })();
-  }, [muaMap]); // tunggu peta MUA agar vendor bisa diisi
+    return () => {
+      alive = false;
+    };
+  }, [muaMap]);
 
   /* --- Pencarian --- */
   const filteredNearby = useMemo(() => {
@@ -313,8 +358,16 @@ export default function UserDashboard() {
   }, [query, nearby]);
 
   // Region aman untuk MapView (hindari NaN)
-  const initialLat = userCoords?.lat ?? (nearby[0]?.lat ?? -6.2);
-  const initialLng = userCoords?.lng ?? (nearby[0]?.lng ?? 106.8);
+  const safeRegion = makeSafeRegion(
+    userCoords?.lat ?? (nearby[0]?.lat ?? -6.2),
+    userCoords?.lng ?? (nearby[0]?.lng ?? 106.8)
+  );
+
+  // Marker hanya untuk koordinat valid (double guard)
+  const nearbyForMarkers = useMemo(
+    () => nearby.filter((m) => Number.isFinite(m.lat) && Number.isFinite(m.lng)),
+    [nearby]
+  );
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 36 }}>
@@ -351,14 +404,14 @@ export default function UserDashboard() {
             {nearby.map((m, idx) => (
               <View key={m.id} style={[styles.nearCard, { marginLeft: idx === 0 ? 0 : 14 }]}>
                 <View style={{ flexDirection: "row", alignItems: "center" }}>
-                  <Image
-                    source={{ uri: m.photo || PLACEHOLDER_AVATAR }}
-                    style={styles.nearPhoto}
-                    onError={() => { m.photo = PLACEHOLDER_AVATAR; }}
-                  />
+                  <Img uri={m.photo} style={styles.nearPhoto} />
                   <View style={{ marginLeft: 10, flex: 1 }}>
-                    <Text style={styles.nearTitle} numberOfLines={1}>{m.name}</Text>
-                    <Text style={styles.nearAddress} numberOfLines={2}>{m.address}</Text>
+                    <Text style={styles.nearTitle} numberOfLines={1}>
+                      {m.name}
+                    </Text>
+                    <Text style={styles.nearAddress} numberOfLines={2}>
+                      {m.address}
+                    </Text>
                   </View>
                 </View>
 
@@ -383,17 +436,8 @@ export default function UserDashboard() {
         {nearbyLoading ? (
           <View style={[styles.mapBox, { backgroundColor: "#EEE" }]} />
         ) : (
-          <MapView
-            style={styles.mapBox}
-            showsUserLocation={!!userCoords}
-            initialRegion={{
-              latitude: initialLat,
-              longitude: initialLng,
-              latitudeDelta: 0.25,
-              longitudeDelta: 0.25,
-            }}
-          >
-            {nearby.map((m) => (
+          <MapView style={styles.mapBox} showsUserLocation={!!userCoords} initialRegion={safeRegion}>
+            {nearbyForMarkers.map((m) => (
               <Marker
                 key={m.id}
                 coordinate={{ latitude: m.lat, longitude: m.lng }}
@@ -434,14 +478,12 @@ export default function UserDashboard() {
               onPress={() => router.push({ pathname: "/(user)/mua/[id]", params: { id: m.id } })}
               activeOpacity={0.8}
             >
-              <Image
-                source={{ uri: m.photo || PLACEHOLDER_AVATAR }}
-                style={styles.avatar}
-                onError={() => { m.photo = PLACEHOLDER_AVATAR; }}
-              />
+              <Img uri={m.photo} style={styles.avatar} />
               <View style={{ flex: 1, marginLeft: 10 }}>
                 <Text style={styles.listTitle}>{m.name}</Text>
-                <Text style={styles.listAddress} numberOfLines={2}>{m.address}</Text>
+                <Text style={styles.listAddress} numberOfLines={2}>
+                  {m.address}
+                </Text>
                 {typeof m.distanceKm === "number" && (
                   <Text style={styles.listCategory}>{formatKm(m.distanceKm)} dari Anda</Text>
                 )}
@@ -567,7 +609,7 @@ const styles = StyleSheet.create({
     gap: 10,
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center"
+    alignItems: "center",
   },
   hello: { fontSize: 20, fontWeight: "600", color: "#111827", flexWrap: "wrap", flex: 1, marginRight: 10 },
   bell: { backgroundColor: PURPLE, width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
