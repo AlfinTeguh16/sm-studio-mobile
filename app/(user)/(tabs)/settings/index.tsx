@@ -6,6 +6,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import * as SecureStore from "expo-secure-store";
 import * as ImagePicker from "expo-image-picker";
+import * as Location from "expo-location";
 import { useRouter } from "expo-router";
 
 type Me = {
@@ -18,10 +19,13 @@ type Me = {
     address?: string | null;
     bio?: string | null;
     photo_url?: string | null;
+    location_lat?: number | null;
+    location_lng?: number | null;
   };
 };
 
 const API_BASE = "https://smstudio.my.id/api";
+const ABS_BASE = "https://smstudio.my.id"; // untuk jadikan URL absolut
 const API_ME = `${API_BASE}/auth/me`;
 const API_PROFILE = `${API_BASE}/auth/profile`;
 const API_LOGOUT = `${API_BASE}/auth/logout`;
@@ -34,6 +38,19 @@ const MUTED = "#6B7280";
 const PickerMediaType: any =
   (ImagePicker as any).MediaType ?? (ImagePicker as any).MediaTypeOptions;
 
+/* ===== Helpers URL foto ===== */
+function toAbsoluteUrl(u?: string | null) {
+  if (!u) return "";
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.startsWith("/")) return `${ABS_BASE}${u}`;
+  return `${ABS_BASE}/${u}`;
+}
+function withBust(u: string) {
+  if (!u) return u;
+  const sep = u.includes("?") ? "&" : "?";
+  return `${u}${sep}t=${Date.now()}`;
+}
+
 export default function SettingsScreen() {
   const router = useRouter();
 
@@ -44,6 +61,11 @@ export default function SettingsScreen() {
   const [phone, setPhone] = useState("");
   const [address, setAddress] = useState("");
   const [bio, setBio] = useState("");
+
+  // GPS
+  const [lat, setLat] = useState<number | null>(null);
+  const [lng, setLng] = useState<number | null>(null);
+  const [locLoading, setLocLoading] = useState(false);
 
   // foto
   const [serverPhotoUrl, setServerPhotoUrl] = useState<string>("");
@@ -103,12 +125,32 @@ export default function SettingsScreen() {
         const me: Me = await res.json();
         if (!mounted.current) return;
 
-        setName(me?.profile?.name || me?.name || "");
-        setPhone(me?.profile?.phone || "");
-        setAddress(me?.profile?.address || "");
-        setBio(me?.profile?.bio || "");
-        const url = me?.profile?.photo_url ?? "";
-        setServerPhotoUrl(url && url !== "null" && url !== "undefined" ? url : "");
+        const prof = me?.profile ?? {};
+        setName((prof?.name ?? me?.name ?? "").trim?.() ?? "");
+        setPhone(prof?.phone ?? "");
+        setAddress(prof?.address ?? "");
+        setBio(prof?.bio ?? "");
+
+        // foto absolut + cache bust agar langsung refresh
+        const rawUrl = prof?.photo_url ?? "";
+        const abs = toAbsoluteUrl(rawUrl);
+        setServerPhotoUrl(abs ? withBust(abs) : "");
+
+        // GPS
+        setLat(
+          typeof prof?.location_lat === "number"
+            ? prof.location_lat
+            : prof?.location_lat
+            ? Number(prof.location_lat)
+            : null
+        );
+        setLng(
+          typeof prof?.location_lng === "number"
+            ? prof.location_lng
+            : prof?.location_lng
+            ? Number(prof.location_lng)
+            : null
+        );
       } catch {
       } finally {
         mounted.current && setLoading(false);
@@ -146,6 +188,27 @@ export default function SettingsScreen() {
     }
   }
 
+  // AMBIL LOKASI GPS
+  async function onPickLocation() {
+    try {
+      setLocLoading(true);
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Izin lokasi ditolak", "Aktifkan izin lokasi untuk mengambil koordinat.");
+        return;
+      }
+      const pos = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      setLat(pos.coords.latitude);
+      setLng(pos.coords.longitude);
+    } catch (e: any) {
+      Alert.alert("Gagal", e?.message || "Tidak bisa mengambil lokasi.");
+    } finally {
+      setLocLoading(false);
+    }
+  }
+
   // SIMPAN (selalu multipart + _method=PATCH; aman walau tanpa foto)
   async function onSave() {
     try {
@@ -153,10 +216,16 @@ export default function SettingsScreen() {
 
       const fd = new FormData();
       fd.append("_method", "PATCH");
-      if (name)    fd.append("name", name);
-      if (phone)   fd.append("phone", phone);
-      if (address) fd.append("address", address);
-      if (bio)     fd.append("bio", bio);
+
+      // kirim field termasuk kosong (biar bisa clear)
+      fd.append("name", name);
+      fd.append("phone", phone);
+      fd.append("address", address);
+      fd.append("bio", bio);
+
+      // kirim GPS kalau ada nilai; kalau ingin clear, kirim kosong string -> BE ubah ke null
+      if (lat !== null && isFinite(Number(lat))) fd.append("location_lat", String(lat));
+      if (lng !== null && isFinite(Number(lng))) fd.append("location_lng", String(lng));
 
       if (photoAsset) {
         fd.append("photo_url", {
@@ -171,7 +240,7 @@ export default function SettingsScreen() {
         headers: {
           Accept: "application/json",
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          // penting: JANGAN set Content-Type
+          // penting: JANGAN set Content-Type untuk FormData
         },
         body: fd,
       });
@@ -186,19 +255,65 @@ export default function SettingsScreen() {
         throw new Error(firstErr);
       }
 
-      const newUrl = json?.profile?.photo_url || json?.photo_url;
+      // Ambil profile dari berbagai bentuk payload
+      const savedProfile =
+        json?.profile ??
+        json?.data?.profile ??
+        json?.data?.user?.profile ??
+        null;
+
+      // foto absolut + cache bust
+      let newUrl: string =
+        savedProfile?.photo_url ||
+        json?.photo_url ||
+        "";
+
       if (newUrl) {
-        setServerPhotoUrl(newUrl);
+        const abs = toAbsoluteUrl(newUrl);
+        setServerPhotoUrl(withBust(abs));
         setPhotoAsset(null);
       }
 
-      // update cache nama lokal
+      // sinkron form state dari server (terutama nama)
+      if (savedProfile) {
+        setName((savedProfile.name ?? name)?.toString?.().trim?.() ?? name);
+        setPhone(savedProfile.phone ?? phone);
+        setAddress(savedProfile.address ?? address);
+        setBio(savedProfile.bio ?? bio);
+
+        setLat(
+          typeof savedProfile.location_lat === "number"
+            ? savedProfile.location_lat
+            : savedProfile.location_lat != null
+            ? Number(savedProfile.location_lat)
+            : lat
+        );
+        setLng(
+          typeof savedProfile.location_lng === "number"
+            ? savedProfile.location_lng
+            : savedProfile.location_lng != null
+            ? Number(savedProfile.location_lng)
+            : lng
+        );
+      }
+
+      // update cache local
       try {
         const raw = await SecureStore.getItemAsync("auth");
         if (raw) {
           const auth = JSON.parse(raw);
-          if (auth?.user) auth.user.name = name;
-          if (auth?.profile) auth.profile.name = name;
+          if (!auth.profile) auth.profile = {};
+          auth.user = auth.user || {};
+          auth.user.name = savedProfile?.name ?? name;
+          auth.profile.name = savedProfile?.name ?? name;
+          auth.profile.phone = savedProfile?.phone ?? phone;
+          auth.profile.address = savedProfile?.address ?? address;
+          auth.profile.bio = savedProfile?.bio ?? bio;
+          auth.profile.photo_url = savedProfile?.photo_url ?? newUrl ?? auth.profile.photo_url;
+          auth.profile.location_lat =
+            savedProfile?.location_lat ?? lat;
+          auth.profile.location_lng =
+            savedProfile?.location_lng ?? lng;
           await SecureStore.setItemAsync("auth", JSON.stringify(auth));
         }
       } catch {}
@@ -249,6 +364,33 @@ export default function SettingsScreen() {
 
       <Text style={styles.label}>Bio</Text>
       <TextInput value={bio} onChangeText={setBio} style={[styles.input, { height: 100, textAlignVertical: "top" }]} placeholder="Tentang Anda" placeholderTextColor={MUTED} multiline />
+
+      {/* GPS */}
+      <Text style={styles.label}>Lokasi (GPS)</Text>
+      <View style={{ marginHorizontal: 20, gap: 8 }}>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          <TextInput
+            value={lat != null ? String(lat) : ""}
+            onChangeText={(t) => setLat(t.trim() === "" ? null : Number(t))}
+            style={[styles.input, { flex: 1 }]}
+            placeholder="Latitude"
+            placeholderTextColor={MUTED}
+            keyboardType="numeric"
+          />
+          <TextInput
+            value={lng != null ? String(lng) : ""}
+            onChangeText={(t) => setLng(t.trim() === "" ? null : Number(t))}
+            style={[styles.input, { flex: 1 }]}
+            placeholder="Longitude"
+            placeholderTextColor={MUTED}
+            keyboardType="numeric"
+          />
+        </View>
+        <TouchableOpacity style={styles.secondaryBtn} onPress={onPickLocation} disabled={locLoading}>
+          {locLoading ? <ActivityIndicator /> : <Ionicons name="navigate-outline" size={18} color={PURPLE} />}
+          <Text style={styles.secondaryText}>{locLoading ? "Mengambil..." : "Ambil Lokasi Saya"}</Text>
+        </TouchableOpacity>
+      </View>
 
       <Text style={styles.label}>Foto Profil</Text>
 

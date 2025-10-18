@@ -20,8 +20,8 @@ import { useRouter } from "expo-router";
 type Booking = {
   id: number | string;
   offering_id?: number | string | null;
-  booking_date?: string;   // ISO date or datetime
-  booking_time?: string;   // "HH:MM"
+  booking_date?: string;   // "YYYY-MM-DD" atau ISO datetime
+  booking_time?: string;   // "HH:mm" atau "HH:mm:ss"
   status?: string;
   mua_id?: string;
   offering?: { name_offer?: string } | null;
@@ -29,7 +29,7 @@ type Booking = {
   amount?: string | number;
   grand_total?: string | number;
   invoice_number?: string;
-  customer_id?: string | number; // <-- penting untuk filter milik user
+  customer_id?: string | number; // penting untuk filter milik user
 };
 
 type MuaLoc = {
@@ -45,7 +45,6 @@ const API_BOOKINGS = `${API_BASE}/bookings`; // server boleh sudah filter by aut
 const API_MUA_LOC = `${API_BASE}/mua-location`;
 const API_ME = `${API_BASE}/me`;             // untuk ambil id user kalau belum tersimpan
 
-const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const TEXT_MUTED = "#6B7280";
 const CARD_BG = "#F7F0FF";
@@ -117,31 +116,71 @@ async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Prom
   }
 }
 
-function parseDateTime(book: Booking): Date | null {
-  const d = book.booking_date;
-  const t = book.booking_time;
-  if (!d && !t) return null;
+/**
+ * Formatter aman untuk menampilkan "jam - tanggal" TANPA membuat Date dari "HH:mm".
+ * - Kalau booking_time ada, ambil 5 char pertama → "HH:mm".
+ * - Tanggal:
+ *   - Jika booking_date ISO (ada 'T' atau jam), parse sekali dan format dengan timeZone Asia/Makassar.
+ *   - Jika booking_date hanya "YYYY-MM-DD", buat Date lokal dan format id-ID.
+ */
+function fmtWhen(book: Booking): string {
+  // 1) Ambil HH:mm aman dari string booking_time
+  let hhmm = "-";
+  if (typeof book.booking_time === "string" && book.booking_time.trim()) {
+    const t = book.booking_time.trim();
+    hhmm = t.length >= 5 ? t.slice(0, 5) : t; // potong "HH:mm:ss" → "HH:mm"
+  }
 
-  let iso = d || "";
-  if (d && t && !d.includes("T")) iso = `${d} ${t}`;
-  const dt = new Date(iso);
-  if (isNaN(+dt) && t) {
-    const parts = (d || "").split("-");
-    if (parts.length === 3) {
-      const [y, m, dd] = parts.map(Number);
-      const [hh, mm] = t.split(":").map(Number);
-      const alt = new Date(y, (m || 1) - 1, dd, hh || 0, mm || 0);
-      return isNaN(+alt) ? null : alt;
+  // 2) Format tanggal (kalau ada)
+  let tanggal = "-";
+  if (typeof book.booking_date === "string" && book.booking_date.trim()) {
+    const dstr = book.booking_date.trim();
+
+    // Case A: booking_date ISO (mengandung 'T' atau jam)
+    const looksLikeISO = /T|\d{2}:\d{2}/.test(dstr);
+    if (looksLikeISO) {
+      const dt = new Date(dstr.replace(" ", "T")); // "YYYY-MM-DDTHH:mm"
+      if (!isNaN(+dt)) {
+        try {
+          tanggal = new Intl.DateTimeFormat("id-ID", {
+            day: "2-digit",
+            month: "long",
+            year: "numeric",
+            timeZone: "Asia/Makassar",
+          }).format(dt);
+          // jika booking_time kosong tapi ISO punya waktu → ambil dari ISO
+          if (hhmm === "-" && /\d{2}:\d{2}/.test(dstr)) {
+            const m = dstr.match(/(\d{2}:\d{2})/);
+            if (m) hhmm = m[1];
+          }
+        } catch {
+          // fallback: ambil bagian tanggal saja
+          tanggal = dstr.split("T")[0] || dstr.split(" ")[0] || dstr;
+        }
+      } else {
+        tanggal = dstr.split("T")[0] || dstr.split(" ")[0] || dstr;
+      }
+    } else {
+      // Case B: hanya "YYYY-MM-DD"
+      try {
+        const [y, m, d] = dstr.split("-").map((v) => parseInt(v, 10));
+        const dt = new Date(y, (m || 1) - 1, d || 1);
+        tanggal = new Intl.DateTimeFormat("id-ID", {
+          day: "2-digit",
+          month: "long",
+          year: "numeric",
+        }).format(dt);
+      } catch {
+        tanggal = dstr;
+      }
     }
   }
-  return isNaN(+dt) ? null : dt;
-}
 
-function fmtHuman(dt: Date | null): string {
-  if (!dt) return "-";
-  const jam = dt.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
-  const tgl = dt.toLocaleDateString("id-ID", { day: "2-digit", month: "long", year: "numeric" });
-  return `${jam} - ${tgl}`;
+  // 3) Gabungkan hasil
+  if (hhmm !== "-" && tanggal !== "-") return `${hhmm} - ${tanggal}`;
+  if (hhmm !== "-") return hhmm;
+  if (tanggal !== "-") return tanggal;
+  return "-";
 }
 
 /* ================= Screen ================= */
@@ -174,18 +213,16 @@ export default function ActiveBookingsScreen() {
       const mine = meId
         ? items.filter((b) => {
             const cid = b.customer_id != null ? String(b.customer_id) : null;
-            // jika API belum mengirim customer_id, kita **skip** (anggap bukan milik user)
             return cid ? cid === meId : false;
           })
-        : []; // jika tidak dapat meId, aman default kosong
+        : [];
 
       // 4) (opsional) Urutkan terbaru dulu
+      // urutkan pakai tanggal+jam tekstual untuk stabilitas tanpa Date parsing agresif
       mine.sort((a, b) => {
-        const da = parseDateTime(a);
-        const db = parseDateTime(b);
-        const ta = da ? +da : 0;
-        const tb = db ? +db : 0;
-        return tb - ta; // desc
+        const da = (a.booking_date || "") + " " + (a.booking_time || "");
+        const db = (b.booking_date || "") + " " + (b.booking_time || "");
+        return db.localeCompare(da);
       });
 
       // 5) Peta MUA
@@ -238,7 +275,7 @@ export default function ActiveBookingsScreen() {
   const renderItem = ({ item }: { item: Booking }) => {
     const title = item.offering?.name_offer || item.name_offer || "Paket";
     const vendor = (item.mua_id && muaMap[item.mua_id]?.name) || "SM Studio";
-    const when = fmtHuman(parseDateTime(item));
+    const when = fmtWhen(item);
     const status = (item.status || "").toUpperCase();
 
     return (

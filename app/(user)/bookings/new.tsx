@@ -12,29 +12,39 @@ import DateTimePicker from "@react-native-community/datetimepicker";
 /* ========= Types ========= */
 type Offering = {
   id: number;
-  mua_id: string; // << harus UUID
+  mua_id?: string; // UUID (optional; hanya fallback)
   name_offer: string;
   offer_pictures?: string[];
   price?: string | number;
   makeup_type?: string | null;
+
+  // dari backend (opsi A: JOIN profiles p.name as mua_name, p.photo_url as mua_photo)
+  mua_name?: string;
+  mua_photo?: string;
+
+  // kemungkinan backend pakai include relasi
+  mua?: { id?: string; name?: string } | null;
 };
 
 type Me = {
-  id?: string | number; // biasanya angka (user id)
-  profile?: { id?: string; name?: string }; // << UUID di sini
+  id?: string | number;
+  profile?: { id?: string; name?: string };
   name?: string;
 };
+
+type MuaProfile = { id?: string; name?: string | null };
 
 /* ========= Const ========= */
 const API_BASE = "https://smstudio.my.id/api";
 const API_OFFERINGS = `${API_BASE}/offerings`;
-const API_BOOKINGS = `${API_BASE}/bookings`;
-const API_ME = `${API_BASE}/auth/me`;
+const API_BOOKINGS  = `${API_BASE}/bookings`;
+const API_ME        = `${API_BASE}/auth/me`;
+const API_MUAS      = `${API_BASE}/mua-location`; // fallback terakhir
 
-const PURPLE = "#AA60C8";
+const PURPLE     = "#AA60C8";
 const TEXT_MUTED = "#6B7280";
-const CARD_BG = "#F7F0FF";
-const BORDER = "#E5E7EB";
+const CARD_BG    = "#F7F0FF";
+const BORDER     = "#E5E7EB";
 
 /* ========= Helpers ========= */
 const formatIDR = (n: number) =>
@@ -59,7 +69,6 @@ async function getTokenAndCustomerUUID(): Promise<{ token: string | null; custom
     try {
       const auth = JSON.parse(raw);
       token = auth?.token ?? null;
-      // coba ambil profile.id (uuid)
       const maybeProfile = auth?.profile?.id || auth?.user?.profile?.id;
       if (maybeProfile && uuidRe.test(String(maybeProfile))) {
         customerUUID = String(maybeProfile);
@@ -84,22 +93,11 @@ async function getTokenAndCustomerUUID(): Promise<{ token: string | null; custom
   return { token, customerUUID };
 }
 
-/** POST with verbose logging + extract error detail dari Laravel */
+/** POST + ekstraksi error Laravel */
 async function postJSONLogged<T = any>(url: string, headers: Record<string, string>, body: any): Promise<T> {
-  const group = `[POST] ${url}`;
-  console.groupCollapsed(group);
-  console.log("headers", headers);
-  console.log("body", body);
-  console.groupEnd();
-
   const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   const ct = res.headers.get("content-type") || "";
   const raw = await res.text();
-
-  console.groupCollapsed(`[POST-res] ${url} -> ${res.status}`);
-  console.log("content-type", ct);
-  console.log("raw", raw);
-  console.groupEnd();
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -136,11 +134,15 @@ export default function BookingCreateScreen() {
 
   // auth + me
   const [token, setToken] = useState<string | null>(null);
-  const [customerId, setCustomerId] = useState<string | null>(null); // << harus UUID
+  const [customerId, setCustomerId] = useState<string | null>(null); // UUID
 
   // offering
   const [item, setItem] = useState<Offering | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // nama vendor (MUA) — resolver fallback
+  const [vendorName, setVendorName] = useState<string>("");
+  const [vendorLoading, setVendorLoading] = useState<boolean>(false);
 
   // form
   const [person, setPerson] = useState(1);
@@ -157,10 +159,10 @@ export default function BookingCreateScreen() {
   const [showPicker, setShowPicker] = useState<null | "date" | "time">(null);
 
   // harga
-  const priceNum = useMemo(() => Number(item?.price ?? 0), [item]);
-  const subTotal = useMemo(() => Math.max(1, person) * priceNum, [person, priceNum]);
+  const priceNum   = useMemo(() => Number(item?.price ?? 0), [item]);
+  const subTotal   = useMemo(() => Math.max(1, person) * priceNum, [person, priceNum]);
   const TAX_PERCENT = 11;
-  const taxAmount = useMemo(() => (subTotal * TAX_PERCENT) / 100, [subTotal]);
+  const taxAmount  = useMemo(() => (subTotal * TAX_PERCENT) / 100, [subTotal]);
   const grandTotal = useMemo(() => subTotal + taxAmount, [subTotal, taxAmount]);
 
   // token + me (pastikan customerId = UUID)
@@ -178,6 +180,8 @@ export default function BookingCreateScreen() {
     (async () => {
       if (!offeringId) return;
       setLoading(true);
+      setVendorLoading(true); // mulai loading nama MUA
+  
       try {
         const res = await fetch(`${API_OFFERINGS}/${offeringId}`, {
           headers: {
@@ -187,17 +191,91 @@ export default function BookingCreateScreen() {
         });
         const json = await res.json().catch(() => ({}));
         const data: Offering = json?.data ?? json;
-        if (mounted) setItem(data);
-      } catch (e: any) {
-        Alert.alert("Gagal", e?.message || "Tidak bisa memuat data offering");
+  
+        if (!mounted) return;
+        setItem(data);
+  
+        // 1) coba ambil dari payload offering (mua_name / relasi mua?.name)
+        const fromOffering =
+          (data as any)?.mua_name ||
+          (data as any)?.mua?.name ||
+          "";
+  
+        if (typeof fromOffering === "string" && fromOffering.trim()) {
+          setVendorName(fromOffering.trim());
+          setVendorLoading(false);
+        } else {
+          // 2) resolve by offeringId (tanpa fallback "SM Studio")
+          const nm = await resolveVendorNameByOfferingId(String(offeringId), token, data?.mua_id);
+          if (mounted) {
+            setVendorName(nm || ""); // tetap kosong jika gagal
+            setVendorLoading(false);
+          }
+        }
+      } catch {
+        if (mounted) {
+          setVendorName("");
+          setVendorLoading(false);
+        }
       } finally {
         if (mounted) setLoading(false);
       }
     })();
-    return () => {
-      mounted = false;
-    };
+    return () => { mounted = false; };
   }, [offeringId, token]);
+
+  // === Nama MUA untuk ditampilkan: prioritaskan dari backend (mua_name), lalu relasi, lalu resolver ===
+  const displayVendor = useMemo(() => {
+    return (
+      item?.mua_name?.trim?.() ||
+      item?.mua?.name?.trim?.() ||
+      vendorName?.trim?.() ||
+      ""
+    );
+  }, [item, vendorName]);
+  
+  // === resolver vendor berdasarkan OFFERING ID ===
+  async function resolveVendorNameByOfferingId(offId: string, authToken: string | null, fallbackMuaId?: string | undefined) {
+    setVendorLoading(true);
+    const authHeader = authToken ? { Authorization: `Bearer ${authToken}` } : undefined;
+
+    // 1) Coba /offerings/:id?include=mua → data.mua.name
+    try {
+      const r1 = await fetch(`${API_OFFERINGS}/${offId}?include=mua`, { headers: { Accept: "application/json", ...authHeader } as any });
+      if (r1.ok) {
+        const j1 = await r1.json().catch(() => ({}));
+        const name = (j1?.data?.mua?.name || j1?.mua?.name || "").trim?.();
+        if (name) return name;
+      }
+    } catch {}
+
+    // 2) Coba /offerings/:id/mua → { name }
+    try {
+      const r2 = await fetch(`${API_OFFERINGS}/${offId}/mua`, { headers: { Accept: "application/json", ...authHeader } as any });
+      if (r2.ok) {
+        const j2 = await r2.json().catch(() => ({}));
+        const data: MuaProfile = j2?.data ?? j2;
+        const name = (data?.name || "").trim?.();
+        if (name) return name;
+      }
+    } catch {}
+
+    // 3) Fallback terakhir: kalau offering punya mua_id → /mua-location/:mua_id
+    try {
+      if (fallbackMuaId && uuidRe.test(String(fallbackMuaId))) {
+        const r3 = await fetch(`${API_MUAS}/${fallbackMuaId}`, { headers: { Accept: "application/json", ...authHeader } as any });
+        if (r3.ok) {
+          const j3 = await r3.json().catch(() => ({}));
+          const data: MuaProfile = j3?.data ?? j3;
+          const name = (data?.name || "").trim?.();
+          if (name) return name;
+        }
+      }
+    } catch {}
+
+    setVendorLoading(false);
+    return null;
+  }
 
   // POST booking
   async function submit() {
@@ -206,18 +284,17 @@ export default function BookingCreateScreen() {
       if (!customerId || !uuidRe.test(customerId)) {
         throw new Error("Akun belum dikenali (customer_id bukan UUID). Silakan login ulang.");
       }
-      if (!uuidRe.test(item.mua_id)) {
+      // pada alur ini, kita tetap kirim mua_id jika tersedia (backend biasanya minta)
+      if (item.mua_id && !uuidRe.test(item.mua_id)) {
         throw new Error("Data MUA tidak valid (mua_id bukan UUID).");
       }
       if (serviceType === "home_service" && !address.trim()) {
         throw new Error("Alamat wajib diisi untuk Home Service.");
       }
 
-      // tanggal invoice = hari ini; due_date minimal sama dengan invoice_date (aman)
       const today = new Date();
       const payload: any = {
         customer_id: customerId,           // UUID
-        mua_id: item.mua_id,               // UUID
         offering_id: Number(item.id),      // integer
         booking_date: ymd(date),           // YYYY-MM-DD
         booking_time: hm(date),            // HH:mm
@@ -228,18 +305,21 @@ export default function BookingCreateScreen() {
 
         // invoice meta
         invoice_date: ymd(today),
-        due_date: ymd(date),               // >= invoice_date
+        due_date: ymd(date),
 
         // pricing
         amount: Number(subTotal),
-        // selected_add_ons: [],           // HAPUS kalau kosong (lihat di bawah)
-        // discount_amount: 0,             // HAPUS kalau nol—biar backend yang default
-        tax: TAX_PERCENT,                  // persen
+        tax: 11, // %
 
         payment_method: "manual",
       };
 
-      // Hapus field yang kosong/zero agar validasi tidak salah paham
+      // Jika backend tetap butuh mua_id, isi bila ada
+      if (item.mua_id && uuidRe.test(item.mua_id)) {
+        payload.mua_id = item.mua_id;
+      }
+
+      // bersihkan field kosong
       Object.keys(payload).forEach((k) => {
         if (
           payload[k] === undefined ||
@@ -258,16 +338,12 @@ export default function BookingCreateScreen() {
       };
 
       const result = await postJSONLogged<{ data?: { id: number | string } }>(API_BOOKINGS, headers, payload);
-
-      // Ambil ID booking dari response Laravel ({ data: {...} })
       const bookingId = result?.data?.id ?? (result as any)?.id;
       if (!bookingId) {
-        console.error("[CreateBooking] Missing booking id in response:", result);
         Alert.alert("Gagal", "Server tidak mengembalikan ID booking.");
         return;
       }
 
-      // SUKSES → langsung ke invoice
       router.replace(`/(user)/bookings/${bookingId}`);
     } catch (e: any) {
       Alert.alert("Gagal", e?.message || "Maaf jadwal mua sudah penuh.");
@@ -307,7 +383,9 @@ export default function BookingCreateScreen() {
             <Text style={styles.cardTitle} numberOfLines={2}>
               {item.name_offer || "Paket"}
             </Text>
-            <Text style={styles.vendor}>SM Studio</Text>
+            <Text style={styles.vendor} numberOfLines={1}>
+              {vendorLoading ? "Memuat MUA..." : (displayVendor || "—")}
+            </Text>
           </View>
         </View>
 
@@ -537,7 +615,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   sumLabel: { color: "#111827" },
-  sumVal: { color: "#111827" },
+  sumVal:   { color: "#111827" },
 
   cta: {
     position: "absolute",

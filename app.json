@@ -2,14 +2,23 @@
   "expo": {
     "name": "SM Studio",
     "slug": "mua-mobile",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
-    "icon": "./assets/splash.jpg",
+    "icon": "./assets/splash.png",
     "userInterfaceStyle": "light",
     "splash": {
-      "image": "./assets/splash.jpg",
+      "image": "./assets/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "enabled": true,
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0,
+      "url": "https://u.expo.dev/d247be69-b2ef-4092-bc95-dfc082ebc904"
     },
     "ios": {
       "supportsTablet": true,
@@ -17,7 +26,8 @@
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Lokasi dipakai untuk menampilkan MUA di sekitar Anda.",
         "NSPhotoLibraryUsageDescription": "Aplikasi memerlukan akses foto untuk memilih/mengunggah gambar.",
-        "NSPhotoLibraryAddUsageDescription": "Aplikasi memerlukan izin untuk menyimpan gambar ke galeri (opsional)."
+        "NSPhotoLibraryAddUsageDescription": "Aplikasi memerlukan izin untuk menyimpan gambar ke galeri (opsional).",
+        "ITSAppUsesNonExemptEncryption": false
       },
       "config": {
         "googleMapsApiKey": "AIzaSyBVXajonAB7XCNtXIzEMNEZWoesn4b4ZVc"
@@ -34,7 +44,8 @@
         "android.permission.READ_MEDIA_IMAGES",
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_MEDIA_AUDIO",
-        "android.permission.READ_EXTERNAL_STORAGE"
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
       ],
       "config": {
         "googleMaps": {
@@ -56,6 +67,7 @@
       "eas": {
         "projectId": "d247be69-b2ef-4092-bc95-dfc082ebc904"
       }
-    }
+    },
+    "owner": "smstudio"
   }
 }
