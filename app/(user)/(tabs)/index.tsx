@@ -1,4 +1,4 @@
-// app/(user)/index.tsx
+// app/(user)/(tabs)/index.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
@@ -15,29 +15,39 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import * as Location from "expo-location";
 import MapView, { Marker, Region } from "react-native-maps";
 import * as SecureStore from "expo-secure-store";
 import { useRouter } from "expo-router";
+import { useUserLocation } from "../../providers/LocationProvider";
 
 /* ---------- Types ---------- */
 type MuaApi = {
   id: string;
-  name: string;
-  location_lat: string | number | null;
-  location_lng: string | number | null;
-  address: string;
-  photo_url: string | null;
+  role?: string | null;
+  name?: string | null;
+  location_lat?: string | number | null;
+  location_lng?: string | number | null;
+  address?: string | null;
+  photo_url?: string | null;
+  services?: string | string[] | null;
+  is_online?: number | boolean | null;
+  phone?: string | null;
+  created_at?: string | null;
 };
+
 type Mua = {
   id: string;
   name: string;
-  address: string;
-  lat: number;
-  lng: number;
+  address?: string | null;
+  lat?: number | null;
+  lng?: number | null;
   photo: string; // URL absolut / placeholder
   distanceKm?: number;
+  services?: string[] | null;
+  is_online?: boolean;
+  phone?: string | null;
 };
+
 type OfferingApi = {
   id: number | string;
   mua_id: string;
@@ -49,8 +59,10 @@ type Offering = {
   id: string;
   title: string;
   vendor: string;
+  mua_id?: string;
   price?: number;
   category?: string;
+  distanceKm?: number;
 };
 
 /* ---------- Consts ---------- */
@@ -58,7 +70,7 @@ const PURPLE = "#AA60C8";
 const CARD_BG = "#F7F2FA";
 const API_ORIGIN = "https://smstudio.my.id";
 const API_BASE = `${API_ORIGIN}/api`;
-const API_NEARBY = `${API_BASE}/mua-location`;
+const API_MUAS = `${API_BASE}/mua`;
 const API_OFFERINGS = `${API_BASE}/offerings`;
 const PLACEHOLDER_AVATAR = "https://via.placeholder.com/96x96.png?text=MUA";
 
@@ -106,7 +118,7 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   const R = 6371;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lat2 - lon1);
+  const dLon = toRad(lon2 - lon1);
   const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
@@ -121,19 +133,13 @@ function safeNum(v: any): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 function formatIDR(v: number) {
-  // Fallback aman jika Intl tidak tersedia di runtime tertentu
   try {
     return new Intl.NumberFormat("id-ID").format(v);
   } catch {
     return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
   }
 }
-function withTimeout<T>(p: Promise<T>, ms: number) {
-  return Promise.race<T>([
-    p,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("Location timeout")), ms)),
-  ]);
-}
+
 /** Normalisasi foto_url ke URL absolut (atau placeholder) */
 function resolvePhotoUrl(u?: string | null): string {
   if (!u) return PLACEHOLDER_AVATAR;
@@ -143,25 +149,22 @@ function resolvePhotoUrl(u?: string | null): string {
   if (s.startsWith("storage/")) return `${API_ORIGIN}/${s}`;
   return `${API_ORIGIN}/${s.replace(/^\/+/, "")}`;
 }
-async function getSafeUserCoords(): Promise<{ lat: number; lng: number } | null> {
+
+/** Parse services (stringified JSON or CSV) */
+function parseServices(s?: string | string[] | null): string[] | null {
+  if (!s) return null;
+  if (Array.isArray(s)) return s;
   try {
-    const enabled = await Location.hasServicesEnabledAsync();
-    const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted" || !enabled) return null;
-
-    const last = await Location.getLastKnownPositionAsync();
-    if (last) return { lat: last.coords.latitude, lng: last.coords.longitude };
-
-    const pos = await withTimeout(
-      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-      10000
-    );
-    return { lat: pos.coords.latitude, lng: pos.coords.longitude };
-  } catch {
-    return null;
-  }
+    const parsed = JSON.parse(s as string);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+  return (s as string)
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
-/** Region aman untuk MapView (hindari NaN) */
+
+/** safe Region helper untuk MapView (hindari NaN) */
 function makeSafeRegion(lat: number, lng: number): Region {
   const latOk = Number.isFinite(lat) ? lat : -6.2;
   const lngOk = Number.isFinite(lng) ? lng : 106.8;
@@ -199,23 +202,24 @@ export default function UserDashboard() {
     };
   }, []);
 
+  // use location from provider
+  const { coords: userCoords, loading: userLocLoading, error, refresh } = useUserLocation();
+
   // Greeting
   const [displayName, setDisplayName] = useState<string>("");
 
   // Search
   const [query, setQuery] = useState("");
 
-  // Nearby MUA
-  const [nearby, setNearby] = useState<Mua[]>([]);
+  // All MUA (includes ones without coords)
+  const [allMua, setAllMua] = useState<Mua[]>([]);
+  const baseMuaRef = useRef<Mua[]>([]); // store raw normalized list for recompute when userCoords changes
   const [nearbyLoading, setNearbyLoading] = useState(true);
   const [muaMap, setMuaMap] = useState<Record<string, Mua>>({});
 
   // Offerings
   const [offerings, setOfferings] = useState<Offering[]>([]);
   const [offeringsLoading, setOfferingsLoading] = useState(true);
-
-  // User coords
-  const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
 
   // Bottom sheet
   const [filterOpen, setFilterOpen] = useState(false);
@@ -232,7 +236,7 @@ export default function UserDashboard() {
       ({ finished }) => finished && setFilterOpen(false)
     );
 
-  /* --- Ambil nama user: SecureStore -> /auth/me -> fallback /mua-location --- */
+  /* --- Ambil nama user: SecureStore -> /auth/me -> fallback /mua --- */
   useEffect(() => {
     (async () => {
       try {
@@ -257,7 +261,7 @@ export default function UserDashboard() {
         }
       } catch {}
       try {
-        const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_NEARBY);
+        const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS);
         const list: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
         const first = list[0];
         if (first?.name && mountedRef.current) setDisplayName(String(first.name));
@@ -265,54 +269,60 @@ export default function UserDashboard() {
     })();
   }, []);
 
-  /* --- Fetch MUA + lokasi aman + validasi jarak --- */
+  /* --- Fetch MUA (only) --- */
   useEffect(() => {
     let alive = true;
     (async () => {
       setNearbyLoading(true);
       try {
         const headers = await getAuthHeaders();
-        const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_NEARBY, { headers });
-        const arr: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
+        const json = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS, { headers });
+        const arr: MuaApi[] = (json as any)?.data ?? (json as MuaApi[]) ?? [];
 
-        // Map + filter hanya yang punya koordinat valid
-        const raw: Mua[] = arr
-          .map((x) => {
-            const lat = toNumber(x.location_lat);
-            const lng = toNumber(x.location_lng);
-            if (lat == null || lng == null) return null;
-            return {
-              id: String(x.id),
-              name: x.name || "MUA",
-              address: x.address || "-",
-              lat,
-              lng,
-              photo: resolvePhotoUrl(x.photo_url),
-            } as Mua;
-          })
-          .filter(Boolean) as Mua[];
+        const onlyMua = arr.filter((x) => String(x.role ?? "").toLowerCase() === "mua");
 
+        const normalized: Mua[] = onlyMua.map((x) => {
+          const lat = toNumber(x.location_lat);
+          const lng = toNumber(x.location_lng);
+          return {
+            id: String(x.id),
+            name: String(x.name ?? "MUA"),
+            address: x.address ?? "-",
+            lat: lat == null ? undefined : lat,
+            lng: lng == null ? undefined : lng,
+            photo: resolvePhotoUrl(x.photo_url),
+            services: parseServices(x.services),
+            is_online: x.is_online === 1 || x.is_online === true,
+            phone: x.phone ?? null,
+          } as Mua;
+        });
+
+        // store base list (without distances) for recompute later
+        baseMuaRef.current = normalized;
+
+        // build map
         const mmap: Record<string, Mua> = {};
-        raw.forEach((m) => (mmap[m.id] = m));
+        normalized.forEach((m) => (mmap[m.id] = m));
         if (alive && mountedRef.current) setMuaMap(mmap);
 
-        let coords = await getSafeUserCoords();
-        if (coords) {
-          const distances = raw.map((m) => haversine(coords!.lat, coords!.lng, m.lat, m.lng));
-          const minKm = Math.min(...distances);
-          if (!Number.isFinite(minKm) || minKm > 3000) coords = null;
+        // if userCoords already available, compute distances immediately
+        if (userCoords) {
+          const rows = normalized
+            .map((m) => {
+              if (isFiniteNumber(m.lat!) && isFiniteNumber(m.lng!)) {
+                const d = haversine(userCoords.lat, userCoords.lng, m.lat!, m.lng!);
+                return { ...m, distanceKm: d };
+              }
+              return { ...m, distanceKm: undefined };
+            })
+            .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+          if (alive && mountedRef.current) setAllMua(rows);
+        } else {
+          // set as-is; distances will be computed in separate effect when userCoords becomes available
+          if (alive && mountedRef.current) setAllMua(normalized);
         }
-        if (alive && mountedRef.current) setUserCoords(coords ?? null);
-
-        const rows = coords
-          ? raw
-              .map((m) => ({ ...m, distanceKm: haversine(coords!.lat, coords!.lng, m.lat, m.lng) }))
-              .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity))
-          : raw;
-
-        if (alive && mountedRef.current) setNearby(rows);
       } catch {
-        if (alive && mountedRef.current) setNearby([]);
+        if (alive && mountedRef.current) setAllMua([]);
       } finally {
         if (alive && mountedRef.current) setNearbyLoading(false);
       }
@@ -320,7 +330,27 @@ export default function UserDashboard() {
     return () => {
       alive = false;
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount; userCoords handled in separate effect below
+
+  /* --- Recompute distances when userCoords becomes available --- */
+  useEffect(() => {
+    if (!userCoords) return;
+    // recompute using baseMuaRef (original normalized list)
+    const normalized = baseMuaRef.current ?? [];
+    if (normalized.length === 0) return;
+    const rows = normalized
+      .map((m) => {
+        if (isFiniteNumber(m.lat!) && isFiniteNumber(m.lng!)) {
+          const d = haversine(userCoords.lat, userCoords.lng, m.lat!, m.lng!);
+          return { ...m, distanceKm: d };
+        }
+        return { ...m, distanceKm: undefined };
+      })
+      .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+    if (mountedRef.current) setAllMua(rows);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userCoords]);
 
   /* --- Fetch offerings (gabungkan nama MUA dari muaMap jika ada) --- */
   useEffect(() => {
@@ -335,6 +365,7 @@ export default function UserDashboard() {
           id: String(x.id),
           title: x.name_offer ?? "Tanpa Judul",
           vendor: muaMap[x.mua_id]?.name || "MUA",
+          mua_id: x.mua_id,
           price: safeNum(x.price),
           category: x.makeup_type ?? undefined,
         }));
@@ -352,21 +383,49 @@ export default function UserDashboard() {
 
   /* --- Pencarian --- */
   const filteredNearby = useMemo(() => {
-    if (!query) return nearby;
+    if (!query) return allMua;
     const q = query.toLowerCase();
-    return nearby.filter((m) => `${m.name} ${m.address}`.toLowerCase().includes(q));
-  }, [query, nearby]);
+    return allMua.filter((m) => `${m.name} ${m.address ?? ""} ${m.services?.join(" ") ?? ""}`.toLowerCase().includes(q));
+  }, [query, allMua]);
+
+  // Batasi ke 5 terdekat untuk section "Temukan MUA"
+  const findList = useMemo(() => {
+    const copy = [...filteredNearby];
+    copy.sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+    return copy.slice(0, 5);
+  }, [filteredNearby]);
+
+  // Hitung jarak tiap offering berdasarkan lokasi MUA (via muaMap) and userCoords, lalu ambil 5 terdekat
+  const findOfferings = useMemo(() => {
+    if (!offerings || offerings.length === 0) return [];
+    const withDist = offerings.map((of) => {
+      const mua = of.mua_id ? muaMap[of.mua_id] : undefined;
+      const lat = mua && isFiniteNumber(mua.lat ?? NaN) ? (mua.lat as number) : undefined;
+      const lng = mua && isFiniteNumber(mua.lng ?? NaN) ? (mua.lng as number) : undefined;
+      if (userCoords && lat != null && lng != null) {
+        const d = haversine(userCoords.lat, userCoords.lng, lat, lng);
+        return { ...of, distanceKm: d };
+      }
+      return { ...of, distanceKm: undefined };
+    });
+    withDist.sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+    return withDist.slice(0, 5);
+  }, [offerings, muaMap, userCoords]);
 
   // Region aman untuk MapView (hindari NaN)
-  const safeRegion = makeSafeRegion(
-    userCoords?.lat ?? (nearby[0]?.lat ?? -6.2),
-    userCoords?.lng ?? (nearby[0]?.lng ?? 106.8)
+  const safeRegion = useMemo(
+    () =>
+      makeSafeRegion(
+        userCoords?.lat ?? (allMua.find((m) => isFiniteNumber(m.lat ?? NaN))?.lat ?? -6.2) as number,
+        userCoords?.lng ?? (allMua.find((m) => isFiniteNumber(m.lng ?? NaN))?.lng ?? 106.8) as number
+      ),
+    [userCoords, allMua]
   );
 
   // Marker hanya untuk koordinat valid (double guard)
   const nearbyForMarkers = useMemo(
-    () => nearby.filter((m) => Number.isFinite(m.lat) && Number.isFinite(m.lng)),
-    [nearby]
+    () => allMua.filter((m) => isFiniteNumber(m.lat ?? NaN) && isFiniteNumber(m.lng ?? NaN)),
+    [allMua]
   );
 
   return (
@@ -385,7 +444,7 @@ export default function UserDashboard() {
       <View style={styles.searchWrap}>
         <Ionicons name="search-outline" size={18} color="#9CA3AF" style={{ marginHorizontal: 8 }} />
         <TextInput
-          placeholder="Search"
+          placeholder="Cari MUA, alamat, atau layanan"
           style={styles.search}
           value={query}
           onChangeText={setQuery}
@@ -397,11 +456,11 @@ export default function UserDashboard() {
       <Section title="MUA Disekitar">
         {nearbyLoading ? (
           <ActivityIndicator style={{ marginVertical: 8 }} />
-        ) : nearby.length === 0 ? (
+        ) : allMua.length === 0 ? (
           <Text style={{ color: "#6B7280" }}>Belum ada data.</Text>
         ) : (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingRight: 20 }}>
-            {nearby.map((m, idx) => (
+            {allMua.map((m, idx) => (
               <View key={m.id} style={[styles.nearCard, { marginLeft: idx === 0 ? 0 : 14 }]}>
                 <View style={{ flexDirection: "row", alignItems: "center" }}>
                   <Img uri={m.photo} style={styles.nearPhoto} />
@@ -417,6 +476,10 @@ export default function UserDashboard() {
 
                 {typeof m.distanceKm === "number" && (
                   <Text style={styles.distanceText}>{formatKm(m.distanceKm)} dari lokasi Anda</Text>
+                )}
+
+                {m.services && m.services.length > 0 && (
+                  <Text style={{ color: "#6B7280", fontSize: 12, marginTop: 6 }}>{m.services.slice(0, 3).join(", ")}</Text>
                 )}
 
                 <TouchableOpacity
@@ -440,9 +503,9 @@ export default function UserDashboard() {
             {nearbyForMarkers.map((m) => (
               <Marker
                 key={m.id}
-                coordinate={{ latitude: m.lat, longitude: m.lng }}
-                title={m.name}
-                description={m.address}
+                coordinate={{ latitude: m.lat as number, longitude: m.lng as number }}
+                title={m.name ?? undefined}
+                description={m.address ?? undefined}
                 onPress={() => router.push({ pathname: "/(user)/mua/[id]", params: { id: m.id } })}
               />
             ))}
@@ -455,12 +518,12 @@ export default function UserDashboard() {
         )}
       </Section>
 
-      {/* List MUA vertikal */}
+      {/* List MUA vertikal (5 terdekat) */}
       <Section
         title="Temukan MUA"
         rightAction={
           <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/(tabs)/mua")}>
-            <Text style={styles.moreText}></Text>
+            <Text style={styles.moreText}>Lihat Semua</Text>
           </TouchableOpacity>
         }
         leftAction={
@@ -471,7 +534,8 @@ export default function UserDashboard() {
         }
       >
         <View style={{ paddingRight: 20 }}>
-          {filteredNearby.map((m) => (
+          <Text style={{ color: "#6B7280", fontSize: 12, marginBottom: 8 }}>Menampilkan 5 terdekat</Text>
+          {findList.map((m) => (
             <TouchableOpacity
               key={m.id}
               style={[styles.listCard, { marginBottom: 10 }]}
@@ -480,26 +544,31 @@ export default function UserDashboard() {
             >
               <Img uri={m.photo} style={styles.avatar} />
               <View style={{ flex: 1, marginLeft: 10 }}>
-                <Text style={styles.listTitle}>{m.name}</Text>
+                <View style={{ flexDirection: "row", alignItems: "center" }}>
+                  <Text style={styles.listTitle}>{m.name}</Text>
+                  {m.is_online ? <View style={styles.onlineDotSmall} /> : null}
+                </View>
                 <Text style={styles.listAddress} numberOfLines={2}>
                   {m.address}
                 </Text>
                 {typeof m.distanceKm === "number" && (
                   <Text style={styles.listCategory}>{formatKm(m.distanceKm)} dari Anda</Text>
                 )}
+                {m.services && m.services.length > 0 ? (
+                  <Text style={{ color: "#6B7280", fontSize: 12, marginTop: 6 }}>{m.services.slice(0, 3).join(", ")}</Text>
+                ) : null}
               </View>
             </TouchableOpacity>
           ))}
         </View>
       </Section>
 
-      {/* Offerings */}
+      {/* Temukan Jasa (5 terdekat) */}
       <Section
         title="Temukan Jasa"
         rightAction={
           <TouchableOpacity style={styles.more} onPress={() => router.push("/(user)/(tabs)/offerings")}>
             <Text style={styles.moreText}>Lebih Banyak</Text>
-            <Ionicons name="arrow-forward" size={14} color="#6B7280" />
           </TouchableOpacity>
         }
         leftAction={
@@ -515,25 +584,31 @@ export default function UserDashboard() {
           ) : offerings.length === 0 ? (
             <Text style={{ color: "#6B7280" }}>Belum ada data.</Text>
           ) : (
-            offerings.map((s) => (
-              <TouchableOpacity
-                key={s.id}
-                style={[styles.serviceCard, { marginBottom: 10 }]}
-                onPress={() => router.push({ pathname: "/(user)/offerings/[id]", params: { id: s.id } })}
-                activeOpacity={0.85}
-              >
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.serviceTitle}>{s.title}</Text>
-                  <Text style={styles.serviceMeta}>{s.vendor}</Text>
-                  {s.category ? <Text style={styles.serviceCategory}>{s.category}</Text> : null}
-                </View>
-                {isFiniteNumber(s.price) ? (
-                  <Text style={styles.price}>IDR {formatIDR(s.price!)}</Text>
-                ) : (
-                  <Text style={[styles.price, { color: "#6B7280" }]}>—</Text>
-                )}
-              </TouchableOpacity>
-            ))
+            <>
+              <Text style={{ color: "#6B7280", fontSize: 12, marginBottom: 8 }}>Menampilkan 5 terdekat</Text>
+              {findOfferings.map((s) => (
+                <TouchableOpacity
+                  key={s.id}
+                  style={[styles.serviceCard, { marginBottom: 10 }]}
+                  onPress={() => router.push({ pathname: "/(user)/offerings/[id]", params: { id: s.id } })}
+                  activeOpacity={0.85}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.serviceTitle}>{s.title}</Text>
+                    <Text style={styles.serviceMeta}>{s.vendor}</Text>
+                    {s.category ? <Text style={styles.serviceCategory}>{s.category}</Text> : null}
+                    {typeof s.distanceKm === "number" ? (
+                      <Text style={{ color: "#6B7280", fontSize: 12, marginTop: 6 }}>{formatKm(s.distanceKm)} dari Anda</Text>
+                    ) : null}
+                  </View>
+                  {isFiniteNumber(s.price) ? (
+                    <Text style={styles.price}>IDR {formatIDR(s.price!)}</Text>
+                  ) : (
+                    <Text style={[styles.price, { color: "#6B7280" }]}>—</Text>
+                  )}
+                </TouchableOpacity>
+              ))}
+            </>
           )}
         </View>
       </Section>
@@ -548,8 +623,8 @@ export default function UserDashboard() {
           <TouchableOpacity
             style={styles.sheetItem}
             onPress={() => {
-              const sorted = [...nearby].sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
-              setNearby(sorted);
+              const sorted = [...allMua].sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+              setAllMua(sorted);
               closeFilter();
             }}
           >
@@ -560,8 +635,8 @@ export default function UserDashboard() {
           <TouchableOpacity
             style={styles.sheetItem}
             onPress={() => {
-              const sorted = [...nearby].sort((a, b) => a.name.localeCompare(b.name));
-              setNearby(sorted);
+              const sorted = [...allMua].sort((a, b) => a.name.localeCompare(b.name));
+              setAllMua(sorted);
               closeFilter();
             }}
           >
@@ -598,7 +673,7 @@ function Section({
   );
 }
 
-/* ---------- Styles ---------- */
+/* ---------- Styles (sama seperti sebelumnya) ---------- */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#fff" },
 
@@ -676,7 +751,7 @@ const styles = StyleSheet.create({
     borderColor: "#EDE9FE",
   },
   avatar: { width: 44, height: 44, borderRadius: 10, backgroundColor: "#eee" },
-  listTitle: { fontWeight: "700", color: "#111827" },
+  listTitle: { fontWeight: "700", color: "#111827", flex: 1 },
   listAddress: { color: "#6B7280", fontSize: 12, marginTop: 2 },
   listCategory: { color: "#6B7280", fontSize: 12, marginTop: 2 },
 
@@ -713,4 +788,12 @@ const styles = StyleSheet.create({
   sheetTitle: { fontWeight: "800", fontSize: 16, marginBottom: 6, textAlign: "center" },
   sheetItem: { flexDirection: "row", alignItems: "center", paddingVertical: 12 },
   sheetItemText: { fontWeight: "600", color: "#111827", marginLeft: 10 },
+
+  onlineDotSmall: {
+    width: 8,
+    height: 8,
+    borderRadius: 99,
+    backgroundColor: "#4ADE80",
+    marginLeft: 8,
+  },
 });

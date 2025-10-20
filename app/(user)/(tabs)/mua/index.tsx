@@ -1,8 +1,16 @@
-// app/(user)/(tabs)/mua/index.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  View, Text, StyleSheet, TextInput, TouchableOpacity, FlatList,
-  ActivityIndicator, RefreshControl, Platform, Alert,
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  ActivityIndicator,
+  RefreshControl,
+  Platform,
+  Alert,
+  Image,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as SecureStore from "expo-secure-store";
@@ -12,16 +20,23 @@ import { useRouter } from "expo-router";
 /* ================= Types ================= */
 type MuaProfile = {
   id: string;
+  role?: string | null;
   name: string;
-  address?: string | null;
+  phone?: string | null;
+  bio?: string | null;
   photo_url?: string | null;
-  location_lat?: number | null;
-  location_lng?: number | null;
+  services?: string | string[] | null; // terkadang stringified JSON
+  location_lat?: number | string | null;
+  location_lng?: number | string | null;
+  address?: string | null;
+  is_online?: number | boolean | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  // price fields optional (tidak ada di contoh, tapi dipertahankan)
   starting_price?: number | null;
   min_price?: number | null;
   lowest_service_price?: number | null;
   price_from?: number | null;
-  created_at?: string | null;
 };
 
 type ApiList<T> = {
@@ -32,7 +47,7 @@ type ApiList<T> = {
 /* ================ Consts & UI ================ */
 const API_ORIGIN = "https://smstudio.my.id";
 const API_BASE = `${API_ORIGIN}/api`;
-const API_MUAS = `${API_BASE}/mua-location`; // ganti kalau endpoint berbeda
+const API_MUAS = `${API_BASE}/mua`;
 const PAGE_SIZE = 20;
 
 const BORDER = "#E5E7EB";
@@ -44,7 +59,7 @@ const ACCENT_TXT = "#6D3FA8";
 type HeaderMap = Record<string, string>;
 type FilterKey = "nearest" | "cheapest" | "expensive" | "newest";
 
-/* ================ Helpers ================ */
+/* ================ Helpers ================================ */
 async function getAuthToken(): Promise<string | null> {
   const raw = await SecureStore.getItemAsync("auth");
   if (!raw) return null;
@@ -106,12 +121,41 @@ function formatIDR(n: number) {
 function getPrice(m: MuaProfile): number | null {
   if (typeof m.starting_price === "number") return m.starting_price;
   if (typeof m.min_price === "number") return m.min_price;
-  if (typeof m.lowest_service_price === "number") return m.lowest_service_price;
+  if (typeof m.lowest_service_price === "number")
+    return m.lowest_service_price;
   if (typeof m.price_from === "number") return m.price_from;
   return null;
 }
+function parseServices(s?: string | string[] | null): string[] | null {
+  if (!s) return null;
+  if (Array.isArray(s)) return s;
+  try {
+    const parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+  // assume comma separated
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+function resolvePhotoUrl(photo?: string | null) {
+  if (!photo) return null;
+  if (photo.startsWith("http://") || photo.startsWith("https://")) return photo;
+  if (photo.startsWith("/")) return `${API_ORIGIN}${photo}`;
+  // fallback: assume already a relative path
+  return `${API_ORIGIN}/${photo}`;
+}
+function initialsFromName(name?: string | null) {
+  if (!name) return "M";
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 1) return parts[0].slice(0, 1).toUpperCase();
+  return (
+    (parts[0].slice(0, 1) + parts[parts.length - 1].slice(0, 1)).toUpperCase()
+  );
+}
 
-/* ================ Screen ================ */
+/* ================ Screen ================================ */
 export default function MuaListScreen() {
   const router = useRouter();
 
@@ -185,27 +229,43 @@ export default function MuaListScreen() {
     }
   }, []);
 
-  // ✅ functional setState agar append konsisten
+  // ==================== fetchPage ====================
   const fetchPage = useCallback(
     async (targetPage: number, append: boolean) => {
       const headers = await getAuthHeaders();
       const url = `${API_MUAS}?page=${targetPage}&per_page=${PAGE_SIZE}`;
-      const json = await safeFetchJSON<ApiList<MuaProfile>>(url, { headers });
-      const list: MuaProfile[] =
-        (json as any)?.data ?? (json as MuaProfile[]) ?? [];
+      const json = await safeFetchJSON<any>(url, { headers });
 
-      setRows((prev) => (append ? [...prev, ...list] : list));
+      // API sample returns `data` and pagination props at root
+      const rawList: any[] = (json as any)?.data ?? (json as any) ?? [];
 
-      const meta = (json as any)?.meta;
-      if (
-        meta &&
-        typeof meta.current_page === "number" &&
-        typeof meta.last_page === "number"
-      ) {
-        setHasMore(meta.current_page < meta.last_page);
+      // ensure only role === 'mua' (backend already returns mua but extra safety)
+      const filtered: MuaProfile[] = rawList.filter(
+        (it) => it && String(it.role).toLowerCase() === "mua"
+      );
+
+      // avoid duplicates when appending
+      if (append) {
+        setRows((prev) => {
+          const map = new Map<string, MuaProfile>();
+          prev.forEach((p) => map.set(String(p.id), p));
+          filtered.forEach((p) => map.set(String(p.id), p));
+          return Array.from(map.values());
+        });
       } else {
-        setHasMore(list.length >= PAGE_SIZE);
+        setRows(filtered);
       }
+
+      // pagination detection
+      if (
+        typeof json.current_page === "number" &&
+        typeof json.last_page === "number"
+      ) {
+        setHasMore(json.current_page < json.last_page);
+      } else {
+        setHasMore(rawList.length >= PAGE_SIZE);
+      }
+
       setPage(targetPage);
     },
     []
@@ -268,9 +328,17 @@ export default function MuaListScreen() {
     }
     const withDist = base.map((m) => {
       const lat =
-        typeof m.location_lat === "number" ? m.location_lat : null;
+        typeof m.location_lat === "number"
+          ? m.location_lat
+          : typeof m.location_lat === "string" && m.location_lat
+          ? Number(m.location_lat)
+          : null;
       const lng =
-        typeof m.location_lng === "number" ? m.location_lng : null;
+        typeof m.location_lng === "number"
+          ? m.location_lng
+          : typeof m.location_lng === "string" && m.location_lng
+          ? Number(m.location_lng)
+          : null;
       let dist: number | null = null;
       if (userLoc && lat != null && lng != null)
         dist = distanceKm(userLoc, { lat, lng });
@@ -311,7 +379,6 @@ export default function MuaListScreen() {
   }: {
     item: MuaProfile & { _dist: number | null; _price: number | null };
   }) => {
-    
     const addr = item.address || "-";
     const distKm =
       item._dist != null
@@ -320,30 +387,65 @@ export default function MuaListScreen() {
         ? "Lokasi ditolak"
         : "—";
 
+    const photo = resolvePhotoUrl(item.photo_url ?? null);
+    const services = parseServices(item.services);
+
     return (
       <TouchableOpacity
         style={styles.card}
         activeOpacity={0.85}
         onPress={() => router.push(`/(user)/mua/${item.id}`)}
       >
+        <View style={styles.cardLeft}>
+          {photo ? (
+            <Image source={{ uri: photo }} style={styles.avatar} />
+          ) : (
+            <View style={styles.avatarFallback}>
+              <Text style={styles.avatarInitials}>
+                {initialsFromName(item.name)}
+              </Text>
+            </View>
+          )}
+        </View>
+
         <View style={{ flex: 1 }}>
-          <Text style={styles.cardTitle} numberOfLines={1}>
-            {item.name}
-          </Text>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <Text style={styles.cardTitle} numberOfLines={1}>
+              {item.name}
+            </Text>
+            {item.is_online ? (
+              <View style={styles.onlineDot} />
+            ) : null}
+          </View>
 
           <Text style={styles.addr} numberOfLines={1}>
             {addr}
           </Text>
 
-          <View style={styles.badgesRow}>
-            <View style={styles.badge}>
-              <Ionicons name="location-outline" size={14} color={ACCENT_TXT} />
-              <Text style={styles.badgeText}>{distKm}</Text>
+          <View style={styles.rowBetween}>
+            <View style={styles.badgesRow}>
+              <View style={styles.badge}>
+                <Ionicons
+                  name="location-outline"
+                  size={14}
+                  color={ACCENT_TXT}
+                />
+                <Text style={styles.badgeText}>{distKm}</Text>
+              </View>
+
+              {services && services.length > 0 ? (
+                <View style={styles.badge}>
+                  <Ionicons name="brush" size={14} color={ACCENT_TXT} />
+                  <Text style={styles.badgeText} numberOfLines={1}>
+                    {services.slice(0, 2).join(", ")}
+                  </Text>
+                </View>
+              ) : null}
             </View>
+
+            <Ionicons name="chevron-forward" size={20} color="#9D61C5" />
           </View>
         </View>
-
-        <Ionicons name="chevron-forward" size={20} color="#9D61C5" />
       </TouchableOpacity>
     );
   };
@@ -389,7 +491,6 @@ export default function MuaListScreen() {
         />
       </View>
 
-      {/* <<<<<< FIX: hilangkan className, pakai style saja >>>>>> */}
       <View style={styles.pills}>
         <FilterPill
           current={filter}
@@ -511,7 +612,6 @@ const styles = StyleSheet.create({
   pills: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8,
     marginHorizontal: 16,
     marginBottom: 8,
   },
@@ -522,6 +622,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderRadius: 999,
     backgroundColor: "#fff",
+    marginRight: 8,
+    marginTop: 6,
   },
   pillText: { color: "#111827" },
 
@@ -530,20 +632,41 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#EFEFEF",
     borderRadius: 14,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
   },
-  cardTitle: { fontSize: 16, fontWeight: "800", color: "#111827" },
+  cardLeft: {
+    marginRight: 12,
+  },
+  avatar: {
+    width: 64,
+    height: 64,
+    borderRadius: 12,
+    backgroundColor: "#f0f0f0",
+  },
+  avatarFallback: {
+    width: 64,
+    height: 64,
+    borderRadius: 12,
+    backgroundColor: "#F7F0FF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  avatarInitials: {
+    fontWeight: "800",
+    color: ACCENT_TXT,
+    fontSize: 20,
+  },
+  cardTitle: { fontSize: 16, fontWeight: "800", color: "#111827", flex: 1 },
   priceText: { marginTop: 2, color: "#111827", fontWeight: "800" },
   addr: { marginTop: 4, color: TEXT_MUTED },
 
   badgesRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    marginTop: 10,
+    marginTop: 8,
   },
   badge: {
     backgroundColor: "#F7F0FF",
@@ -554,7 +677,21 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    marginRight: 8,
   },
   badgeText: { color: ACCENT_TXT, fontWeight: "700", fontSize: 12 },
+
+  rowBetween: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  onlineDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 99,
+    backgroundColor: "#4ADE80",
+    marginLeft: 8,
+  },
 });
