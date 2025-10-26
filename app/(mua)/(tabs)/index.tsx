@@ -324,12 +324,7 @@ export default function MuaDashboard() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 24 }}>
-      <View>
-        <TouchableOpacity onPress={onGetLocation}>
-          <Text>Ambil Lokasi</Text>
-        </TouchableOpacity>
-        {coords && <Text>{coords.lat}, {coords.lng}</Text>}
-      </View>
+     
       {/* Header */}
       <View style={styles.header}>
         <View>

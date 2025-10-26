@@ -1,5 +1,5 @@
+// app/App.tsx
 import "expo-router/entry";
-/// App.tsx
 import React, { useEffect } from "react";
 import { Platform } from "react-native";
 import {
@@ -9,9 +9,10 @@ import {
   reloadAsync,
   UpdateCheckResult,
 } from "expo-updates";
+import { Slot } from "expo-router";
 
-// (opsional) komponen root aplikasi kamu
-import { Slot } from "expo-router"; // kalau kamu pakai expo-router; atau ganti dengan komponenmu sendiri
+// IMPORT MIGRATE — sesuaikan path jika perlu
+import { migrateAuthIfNeeded } from "./utils/migrateAuth";
 
 export default function App() {
   // Hook ini HANYA memberi state event (isUpdateAvailable, isUpdatePending) & listener
@@ -23,22 +24,40 @@ export default function App() {
 
     (async () => {
       try {
-        // 1) cek ke server EAS Update
-        const result: UpdateCheckResult = await checkForUpdateAsync();
+        // 0) Jalankan migrasi auth terlebih dahulu (jika ada data lama)
+        // migrateAuthIfNeeded menangani kasus "sudah dimigrasi" sendiri
+        try {
+          await migrateAuthIfNeeded();
+          console.log("migrateAuthIfNeeded: done");
+        } catch (mErr) {
+          console.warn("migrateAuthIfNeeded failed:", mErr);
+          // lanjutkan ke update check walau migrasi gagal
+        }
 
-        if (result.isAvailable) {
-          // 2) unduh update
-          await fetchUpdateAsync();
-          // 3) terapkan (reload ke bundle baru)
-          await reloadAsync();
+        // 1) cek ke server EAS Update
+        let result: UpdateCheckResult | null = null;
+        try {
+          result = await checkForUpdateAsync();
+        } catch (checkErr) {
+          console.warn("[updates] checkForUpdateAsync failed:", checkErr);
+        }
+
+        // jika ada update, fetch + reload
+        if (result?.isAvailable) {
+          try {
+            await fetchUpdateAsync();
+            // reload ke bundle baru
+            await reloadAsync();
+          } catch (fetchErr) {
+            console.warn("[updates] failed to fetch/reload:", fetchErr);
+          }
         }
       } catch (e) {
         // optional: log / silently ignore
-        console.warn("[updates] failed:", e);
+        console.warn("[app startup] unexpected error:", e);
       }
     })();
   }, []);
 
-  return <Slot />; // atau return <YourRootComponent />
+  return <Slot />;
 }
-

@@ -15,6 +15,14 @@ const API_READ_ALL = `${API}/notifications/read-all`;
 const API_DEL = (id: string|number) => `${API}/notifications/${id}`;
 const API_DEL_ALL = `${API}/notifications`;
 
+/**
+ * Heuristic responder endpoint for invites.
+ * If your backend has a different route, change this function.
+ * Expects POST body: { action: 'accept'|'decline' }
+ */
+const API_INVITE_RESPOND = (bookingId: string | number) =>
+  `${API}/bookings/${bookingId}/collaborators/respond`;
+
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const MUTED = "#6B7280";
@@ -26,7 +34,7 @@ type Notif = {
   user_id: string;
   title: string;
   message: string;
-  type: "booking"|"system"|"payment";
+  type: string; // can be 'booking_invite', 'booking', 'system', 'payment', etc.
   is_read: boolean;
   created_at?: string;
 };
@@ -40,6 +48,23 @@ const fmtTime = (iso?: string)=> {
   if(!Number.isFinite(+d)) return iso;
   return d.toLocaleString("id-ID",{ day:"2-digit", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit" });
 };
+
+/** Try to extract booking id from message.
+ * Looks for patterns: "#123", "INV-123", or last run of digits.
+ */
+function extractBookingIdFromMessage(message?: string): string | null {
+  if (!message) return null;
+  // #123 pattern
+  const m1 = message.match(/#\s*(\d+)/);
+  if (m1 && m1[1]) return m1[1];
+  // INV-123 or INV123
+  const m2 = message.match(/INV[-\s]*([0-9]+)/i);
+  if (m2 && m2[1]) return m2[1];
+  // fallback: last standalone number in message
+  const allNums = message.match(/(\d{3,})/g); // require at least 3 digits to avoid phone/other small numbers
+  if (allNums && allNums.length) return allNums[allNums.length - 1];
+  return null;
+}
 
 export default function NotificationsScreen(){
   const router = useRouter();
@@ -112,8 +137,9 @@ export default function NotificationsScreen(){
       setPage(1);
       setHasMore(1 < lastPage);
       fetchUnread();
-    }catch{}
-    setRefreshing(false);
+    }catch{}finally{
+      setRefreshing(false);
+    }
   },[fetchPage, fetchUnread]);
 
   const loadMore = useCallback(async ()=>{
@@ -158,8 +184,133 @@ export default function NotificationsScreen(){
     }catch{}
   };
 
+  // ----- Invite respond handling -----
+  const respondInvite = async (notif: Notif, action: "accept"|"decline") => {
+    // try to extract booking id
+    const bookingId = extractBookingIdFromMessage(notif.message);
+    if (!bookingId) {
+      Alert.alert("Tidak dapat menanggapi", "Informasi booking tidak ditemukan pada notifikasi. Hubungi admin.");
+      return;
+    }
+
+    try {
+      // optimistic: set busy state on that item by marking is_read true and show spinner inline
+      setItems(prev => prev.map(i => i.id === notif.id ? { ...i, is_read: true } : i));
+
+      // call backend respond endpoint (you may need to change path to match your API)
+      const res = await fetch(API_INVITE_RESPOND(bookingId), {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ action })
+      });
+
+      const txt = await res.text();
+      if (!res.ok) {
+        let err = `HTTP ${res.status}`;
+        try { err = JSON.parse(txt)?.message || err; } catch {}
+        throw new Error(err);
+      }
+
+      // success: mark notification read and optionally remove it or show success
+      await markRead(notif.id, true);
+
+      // Best UX: remove notification from list when accepted or declined
+      setItems(prev => prev.filter(i => i.id !== notif.id));
+      fetchUnread();
+
+      Alert.alert(
+        action === "accept" ? "Terkonfirmasi" : "Ditolak",
+        action === "accept" ? "Anda telah menerima undangan." : "Anda menolak undangan."
+      );
+    } catch (e: any) {
+      console.warn("respondInvite error:", e);
+      Alert.alert("Gagal", e?.message || "Tidak dapat menanggapi undangan.");
+      // rollback read flag if needed
+      setItems(prev => prev.map(i => i.id === notif.id ? { ...i, is_read: notif.is_read } : i));
+    }
+  };
+
+  // Rendering invite card
+  const InviteCard = ({ item }: { item: Notif }) => {
+    const bookingId = extractBookingIdFromMessage(item.message);
+    return (
+      <View style={[styles.cardInvite]}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <Text style={[styles.titleInvite]} numberOfLines={2}>{item.title || "Undangan Kolaborasi"}</Text>
+          <Text style={{ color: MUTED, fontSize: 12 }}>{fmtTime(item.created_at)}</Text>
+        </View>
+
+        <Text style={[styles.msgInvite, { marginTop: 8 }]}>{item.message}</Text>
+
+        {bookingId ? (
+          <Text style={[styles.metaInvite]}>Booking: <Text style={{ fontWeight:"800" }}>{bookingId}</Text></Text>
+        ) : (
+          <Text style={[styles.metaInvite]}>Booking: <Text style={{ fontStyle:"italic" }}>tidak diketahui</Text></Text>
+        )}
+
+        <View style={{ flexDirection: "row", marginTop: 12, gap: 8 }}>
+          <TouchableOpacity
+            style={[styles.btnAccept]}
+            onPress={() => {
+              Alert.alert(
+                "Konfirmasi",
+                "Terima undangan ini?",
+                [
+                  { text: "Batal", style: "cancel" },
+                  { text: "Terima", onPress: () => respondInvite(item, "accept") }
+                ]
+              );
+            }}
+          >
+            <Text style={{ color: "#fff", fontWeight: "800" }}>Terima</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.btnDecline]}
+            onPress={() => {
+              Alert.alert(
+                "Konfirmasi",
+                "Tolak undangan ini?",
+                [
+                  { text: "Batal", style: "cancel" },
+                  { text: "Tolak", onPress: () => respondInvite(item, "decline") }
+                ]
+              );
+            }}
+          >
+            <Text style={{ color: "#111827", fontWeight: "700" }}>Tolak</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.iconBtnSmall]}
+            onPress={() => markRead(item.id, !item.is_read)}
+          >
+            <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.iconBtnSmall, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]}
+            onPress={() => deleteOne(item.id)}
+          >
+            <Ionicons name="trash-outline" size={18} color="#DC2626" />
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
+
   const renderItem = ({ item }: { item: Notif })=>{
+    // if it's an invite (by type or message content) show invite card
+    const isInvite = item.type === "booking_invite" || /mengundang/i.test(item.message || "");
     const color = item.type==="booking" ? "#0EA5E9" : item.type==="payment" ? "#10B981" : "#A78BFA";
+    if (isInvite) {
+      return (
+        <View style={{ paddingHorizontal: 16 }}>
+          <InviteCard item={item} />
+        </View>
+      );
+    }
+
     return (
       <TouchableOpacity
         onPress={()=> router.push({ pathname:"/(mua)/notifications/[id]", params:{ id:String(item.id) } })}
@@ -167,7 +318,7 @@ export default function NotificationsScreen(){
         activeOpacity={0.9}
       >
         <View style={[styles.badgeType, { borderColor: color, backgroundColor: `${color}1A` }]}>
-          <Text style={{ color, fontWeight:"800", fontSize:12 }}>{item.type.toUpperCase()}</Text>
+          <Text style={{ color, fontWeight:"800", fontSize:12 }}>{(item.type||"GEN").toUpperCase()}</Text>
         </View>
         <View style={{ flex:1 }}>
           <Text style={[styles.title, !item.is_read && { color:TEXT }]} numberOfLines={2}>{item.title}</Text>
@@ -224,7 +375,7 @@ export default function NotificationsScreen(){
         keyExtractor={(it)=> String(it.id)}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         contentContainerStyle={{ paddingHorizontal:16, paddingBottom:24 }}
-        ItemSeparatorComponent={()=> <View style={{ height:10 }}/>}
+        ItemSeparatorComponent={()=> <View style={{ height:10 }} />}
         renderItem={renderItem}
         onEndReachedThreshold={0.3}
         onEndReached={loadMore}
@@ -253,4 +404,45 @@ const styles = StyleSheet.create({
   time:{ color:MUTED, marginTop:6, fontSize:12 },
   iconBtn:{ width:34, height:34, borderRadius:8, borderWidth:1, borderColor:BORDER, backgroundColor:"#fff", alignItems:"center", justifyContent:"center" },
   unreadDot:{ position:"absolute", right:8, top:8, width:10, height:10, borderRadius:5, backgroundColor:"#EF4444" },
+
+  /* Invite card */
+  cardInvite: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: CARD_BG,
+    borderRadius: 12,
+    padding: 14,
+  },
+  titleInvite: { fontWeight: "900", fontSize: 15, color: TEXT },
+  msgInvite: { color: MUTED },
+  metaInvite: { color: MUTED, marginTop: 8, fontSize: 13 },
+  btnAccept: {
+    backgroundColor: "#10B981",
+    paddingHorizontal: 16,
+    height: 44,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  btnDecline: {
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    paddingHorizontal: 14,
+    height: 44,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  iconBtnSmall: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 8,
+  }
 });

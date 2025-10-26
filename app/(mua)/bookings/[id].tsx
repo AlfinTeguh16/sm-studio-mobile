@@ -10,11 +10,17 @@ import {
   Alert,
   Platform,
   Share,
+  Modal,
+  FlatList,
+  TextInput,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import * as Clipboard from "expo-clipboard";
+
+
+
 
 /* ================== Types ================== */
 type Booking = {
@@ -67,6 +73,7 @@ const API_BOOKING = (id: string | number) => `${API_BASE}/bookings/${id}`;
 const API_OFFERING = (id: string | number) => `${API_BASE}/offerings/${id}`;
 const API_MUA_LOC = `${API_BASE}/mua-location`;
 const API_BOOKING_COMPLETE = (id: string | number) => `${API_BASE}/bookings/${id}/complete`;
+const API_BOOKING_COLLABORATORS = (id: string | number) => `${API_BASE}/bookings/${id}/collaborators`;
 
 const PURPLE = "#AA60C8";
 const MUTED = "#6B7280";
@@ -95,6 +102,7 @@ function fmtDate(idt?: string | null) {
 
 type HeaderMap = Record<string, string>;
 
+
 async function getAuthToken(): Promise<string | null> {
   const raw = await SecureStore.getItemAsync("auth");
   if (!raw) return null;
@@ -105,6 +113,8 @@ async function getAuthToken(): Promise<string | null> {
     return null;
   }
 }
+
+
 async function getAuthHeaders(): Promise<HeaderMap> {
   const token = await getAuthToken();
   const h: HeaderMap = { Accept: "application/json" };
@@ -147,6 +157,14 @@ export default function BookingInvoiceScreen() {
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false); // <-- indikator update status
 
+  // --- invite modal state ---
+  const [inviteModalVisible, setInviteModalVisible] = useState(false);
+  const [muaList, setMuaList] = useState<MuaLoc[]>([]);
+  const [muaLoading, setMuaLoading] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+
   // Fetch booking + (opsional) offering + nama MUA
   useEffect(() => {
     if (!id) return;
@@ -169,9 +187,10 @@ export default function BookingInvoiceScreen() {
           setOffering((oJson as any)?.data ?? (oJson as Offering));
         }
 
-        // nama/alamat MUA
+        // nama/alamat MUA (ambil list MUA dulu, find yang cocok)
         const mJson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers });
         const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
+        setMuaList(list); // simpan full list (juga dipakai modal)
         const found = list.find((m) => m.id === bData.mua_id) || null;
         setMua(found);
       } catch (e: any) {
@@ -187,6 +206,26 @@ export default function BookingInvoiceScreen() {
       }
     })();
   }, [id, router]);
+
+  // Fetch MUA list on-demand (if modal open and list empty)
+  useEffect(() => {
+    if (!inviteModalVisible) return;
+    // if we already loaded muaList from initial fetch, skip
+    if (muaList.length > 0) return;
+    (async () => {
+      try {
+        setMuaLoading(true);
+        const headers = await getAuthHeaders();
+        const mJson = await safeFetchJSON<{ data?: MuaLoc[] } | MuaLoc[]>(API_MUA_LOC, { headers });
+        const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
+        setMuaList(list);
+      } catch (e: any) {
+        Alert.alert("Gagal", e?.message || "Tidak bisa memuat daftar MUA.");
+      } finally {
+        setMuaLoading(false);
+      }
+    })();
+  }, [inviteModalVisible]); // only when open
 
   // Hitung total (fallback jika backend tidak kirim beberapa field)
   const computed = useMemo(() => {
@@ -212,23 +251,21 @@ export default function BookingInvoiceScreen() {
     return "#F59E0B";
   }, [booking]);
 
-  
   async function markCompleted() {
     try {
       if (!id) return;
       setUpdating(true);
       const headers = await getAuthHeaders();
-  
+
       // Panggil route: Route::post('bookings/{booking}/complete', ...)
       const result = await safeFetchJSON<{ data?: Booking } | Booking>(
         API_BOOKING_COMPLETE(id),
         {
           method: "POST",
-          headers,              // JANGAN set Content-Type manual kalau tanpa body
-          // body: JSON.stringify({}) // (opsional, hapus kalau controller tak butuh body)
+          headers,
         }
       );
-  
+
       const updated: Booking = (result as any)?.data ?? (result as Booking);
       setBooking(updated);
       Alert.alert("Berhasil", "Status booking ditandai selesai.");
@@ -237,6 +274,98 @@ export default function BookingInvoiceScreen() {
     } finally {
       setUpdating(false);
     }
+  }
+
+  // --- Invite helpers ---
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id);
+      return [...prev, id];
+    });
+  }
+
+  function filteredMuaList() {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return muaList;
+    return muaList.filter((m) => (m.name || "").toLowerCase().includes(q) || (m.address || "").toLowerCase().includes(q));
+  }
+
+  // determine if we can invite
+  const isCompleted = booking?.status === "completed";
+  const canInvite = !isCompleted;
+
+  function openInviteModal() {
+    if (!canInvite) {
+      Alert.alert("Tidak bisa", "Booking sudah selesai — tidak dapat mengundang collaborator.");
+      return;
+    }
+    setInviteModalVisible(true);
+  }
+
+  async function sendInvite() {
+    if (!id) {
+      Alert.alert("Error", "Booking tidak valid.");
+      return;
+    }
+    if (!canInvite) {
+      Alert.alert("Tidak bisa", "Booking sudah selesai — tidak dapat mengundang collaborator.");
+      return;
+    }
+    if (selectedIds.length === 0) {
+      Alert.alert("Pilih MUA", "Pilih minimal satu MUA untuk diundang.");
+      return;
+    }
+
+    Alert.alert(
+      "Konfirmasi",
+      `Undang ${selectedIds.length} MUA ke booking ini?`,
+      [
+        { text: "Batal", style: "cancel" },
+        {
+          text: "Undang",
+          onPress: async () => {
+            try {
+              setInviteLoading(true);
+              const headers = await getAuthHeaders();
+              headers["Content-Type"] = "application/json";
+              const body = JSON.stringify({ profile_ids: selectedIds, role: "assistant" });
+
+              const res = await safeFetchJSON(API_BOOKING_COLLABORATORS(id), {
+                method: "POST",
+                headers,
+                body,
+              });
+
+              // backend mungkin mengembalikan booking updated, atau message
+              // kita lakukan refetch booking sederhana
+              try {
+                const headers2 = await getAuthHeaders();
+                const bJson = await safeFetchJSON<{ data?: Booking } | Booking>(API_BOOKING(id), { headers: headers2 });
+                const bData: Booking = (bJson as any)?.data ?? (bJson as Booking);
+                setBooking(bData);
+              } catch (e) {
+                // ignore refetch failure
+              }
+
+              setInviteModalVisible(false);
+              setSelectedIds([]);
+              Alert.alert("Sukses", "Undangan berhasil dikirim.");
+            } catch (e: any) {
+              if (e?.message === "401_UNAUTH") {
+                Alert.alert("Sesi berakhir", "Silakan login kembali.");
+                await SecureStore.deleteItemAsync("auth").catch(() => {});
+                router.replace("/(auth)/login");
+              } else {
+                Alert.alert("Gagal", e?.message || "Tidak dapat mengirim undangan.");
+              }
+            } finally {
+              setInviteLoading(false);
+            }
+          },
+        },
+      ],
+      { cancelable: true }
+    );
   }
 
   if (loading) {
@@ -263,7 +392,6 @@ export default function BookingInvoiceScreen() {
   const title = offering?.name_offer || "Paket/Jasa";
   const inv = booking.invoice_number || `INV-${booking.id}`;
   const waktu = `${fmtDate(booking.booking_date)} • ${booking.booking_time || "-"}`;
-  const isCompleted = booking.status === "completed";
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
@@ -347,7 +475,16 @@ export default function BookingInvoiceScreen() {
             <Text style={{ color: "#fff", fontWeight: "800" }}>Salin No. Invoice</Text>
           </TouchableOpacity>
 
-          {/* === NEW: tombol 'Selesai' === */}
+          {/* Invite only shown when booking not completed */}
+          {canInvite ? (
+            <TouchableOpacity
+              style={[styles.btn, { backgroundColor: "#6B7280" }]}
+              onPress={openInviteModal}
+            >
+              <Text style={{ color: "#fff", fontWeight: "800" }}>Invite Collaborator</Text>
+            </TouchableOpacity>
+          ) : null}
+
           <TouchableOpacity
             disabled={isCompleted || updating}
             style={[
@@ -383,6 +520,101 @@ export default function BookingInvoiceScreen() {
           </Text>
         </View>
       </View>
+
+      {/* Invite Modal */}
+      <Modal
+        visible={inviteModalVisible}
+        animationType="slide"
+        onRequestClose={() => setInviteModalVisible(false)}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <TouchableOpacity onPress={() => setInviteModalVisible(false)} style={styles.modalClose}>
+              <Ionicons name="close" size={20} color="#111" />
+            </TouchableOpacity>
+            <Text style={styles.modalTitle}>Invite Collaborator</Text>
+            <View style={{ width: 36 }} />
+          </View>
+
+          <View style={{ paddingHorizontal: 16 }}>
+            <Text style={{ marginBottom: 8, color: MUTED }}>Cari MUA (nama atau alamat)</Text>
+            <TextInput
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholder="Cari..."
+              style={styles.searchInput}
+            />
+          </View>
+
+          <View style={{ flex: 1, marginTop: 12 }}>
+            {muaLoading ? (
+              <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
+                <ActivityIndicator />
+              </View>
+            ) : (
+              <FlatList
+                data={filteredMuaList()}
+                keyExtractor={(item) => item.id}
+                renderItem={({ item }) => {
+                  const checked = selectedIds.includes(item.id);
+                  // skip if this is lead mua (can't invite lead to itself)
+                  const isLead = booking?.mua_id === item.id;
+                  return (
+                    <TouchableOpacity
+                      onPress={() => !isLead && toggleSelect(item.id)}
+                      style={[styles.muaRow, isLead && { opacity: 0.5 }]}
+                    >
+                      <View>
+                        <Text style={{ fontWeight: "700" }}>{item.name}</Text>
+                        {item.address ? <Text style={{ color: MUTED, marginTop: 2 }}>{item.address}</Text> : null}
+                      </View>
+                      <View style={{ flexDirection: "row", alignItems: "center" }}>
+                        {isLead ? (
+                          <Text style={{ color: MUTED, fontSize: 12 }}>Lead</Text>
+                        ) : (
+                          <TouchableOpacity onPress={() => toggleSelect(item.id)} style={styles.checkbox}>
+                            {checked ? (
+                              <Ionicons name="checkmark-circle" size={22} color={PURPLE} />
+                            ) : (
+                              <Ionicons name="ellipse-outline" size={22} color="#9CA3AF" />
+                            )}
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    </TouchableOpacity>
+                  );
+                }}
+                ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: "#F3F4F6" }} />}
+                ListEmptyComponent={() => (
+                  <View style={{ padding: 20, alignItems: "center" }}>
+                    <Text style={{ color: MUTED }}>Daftar MUA kosong.</Text>
+                  </View>
+                )}
+              />
+            )}
+          </View>
+
+          <View style={{ padding: 16 }}>
+            <TouchableOpacity
+              style={[styles.btn, { backgroundColor: PURPLE, marginBottom: 10 }]}
+              onPress={sendInvite}
+              disabled={inviteLoading}
+            >
+              {inviteLoading ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={{ color: "#fff", fontWeight: "800" }}>
+                  Undang {selectedIds.length > 0 ? `(${selectedIds.length})` : ""}
+                </Text>
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.btn, { backgroundColor: "#F3F4F6" }]} onPress={() => setInviteModalVisible(false)}>
+              <Text style={{ color: "#111827", fontWeight: "800" }}>Tutup</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -477,4 +709,53 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   infoText: { color: "#4B5563", flex: 1, lineHeight: 18 },
+
+  /* Modal */
+  modalContainer: {
+    flex: 1,
+    backgroundColor: "#fff",
+    paddingTop: Platform.select({ ios: 20, android: 12 }), // <-- added paddingTop for modal
+  },
+  modalHeader: {
+    height: 56,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderBottomWidth: 1,
+    borderColor: "#F3F4F6",
+  },
+  modalClose: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: "#F3F4F6",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalTitle: { fontWeight: "800", fontSize: 16, color: "#111827" },
+
+  searchInput: {
+    height: 42,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    paddingHorizontal: 12,
+    backgroundColor: "#fff",
+  },
+
+  muaRow: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  checkbox: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 });
