@@ -1,10 +1,19 @@
-import React, { useEffect, useState } from "react";
-import { View, Text, StyleSheet, FlatList, ActivityIndicator, TouchableOpacity } from "react-native";
+// app/(mua)/tabs/booking.tsx
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  ActivityIndicator,
+  TouchableOpacity,
+  RefreshControl,
+} from "react-native";
 import * as SecureStore from "expo-secure-store";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
+import { api } from "../../../../lib/api"; // sesuaikan path jika perlu
 
-const API = "https://smstudio.my.id/api";
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const CARD_BG = "#F7F2FA";
@@ -23,12 +32,11 @@ type Row = {
 
 function pillColor(status?: string | null) {
   const s = (status || "").toLowerCase();
-  // warna dasar sederhana
-  if (["completed"].includes(s)) return { fg: "#166534", bg: "#DCFCE7", bd: "#86EFAC" };   // hijau
-  if (["confirmed", "in_progress"].includes(s)) return { fg: "#1D4ED8", bg: "#DBEAFE", bd: "#93C5FD" }; // biru
-  if (["pending"].includes(s)) return { fg: "#92400E", bg: "#FEF3C7", bd: "#FCD34D" };     // kuning
-  if (["rejected", "cancelled"].includes(s)) return { fg: "#B91C1C", bg: "#FEE2E2", bd: "#FCA5A5" };   // merah
-  return { fg: "#374151", bg: "#F3F4F6", bd: "#E5E7EB" }; // netral
+  if (["completed"].includes(s)) return { fg: "#166534", bg: "#DCFCE7", bd: "#86EFAC" };
+  if (["confirmed", "in_progress"].includes(s)) return { fg: "#1D4ED8", bg: "#DBEAFE", bd: "#93C5FD" };
+  if (["pending"].includes(s)) return { fg: "#92400E", bg: "#FEF3C7", bd: "#FCD34D" };
+  if (["rejected", "cancelled"].includes(s)) return { fg: "#B91C1C", bg: "#FEE2E2", bd: "#FCA5A5" };
+  return { fg: "#374151", bg: "#F3F4F6", bd: "#E5E7EB" };
 }
 
 function StatusPill({ label }: { label?: string | null }) {
@@ -44,13 +52,16 @@ function StatusPill({ label }: { label?: string | null }) {
 
 export default function MuaBookingsAccepted() {
   const router = useRouter();
-  const [token, setToken] = useState<string | null>(null);
+
   const [profileId, setProfileId] = useState<string | null>(null);
   const [role, setRole] = useState<"mua" | "customer" | "admin" | null>(null);
+
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [errorText, setErrorText] = useState<string | null>(null);
 
-  // 1) Muat auth dari SecureStore & fallback ke /auth/me
+  // 1) ambil profile & role dari SecureStore jika ada
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -58,81 +69,91 @@ export default function MuaBookingsAccepted() {
         const raw = await SecureStore.getItemAsync("auth").catch(() => null);
         if (raw) {
           const auth = JSON.parse(raw);
-          if (alive) {
-            setToken(auth?.token || null);
-            setProfileId(auth?.profile?.id || auth?.user?.profile?.id || null);
-            setRole(auth?.profile?.role || auth?.user?.role || null);
-          }
+          if (!alive) return;
+          setProfileId(auth?.profile?.id || auth?.user?.profile?.id || null);
+          setRole(auth?.profile?.role || auth?.user?.role || null);
         }
-      } catch {}
+      } catch (err) {
+        // ignore
+      }
     })();
     return () => {
       alive = false;
     };
   }, []);
 
-  // 2) Jika data profil belum lengkap, panggil /auth/me pakai token
+  // 2) fallback: jika profileId/role belum ada, panggil api.me()
   useEffect(() => {
     let alive = true;
     (async () => {
-      if (!token) return;
-      if (profileId && role) return; // sudah cukup
+      if (profileId && role) return;
       try {
-        const meRes = await fetch(`${API}/auth/me`, {
-          headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-        });
-        const me = await meRes.json();
+        const me = await api.me();
         if (!alive) return;
         setProfileId(me?.profile?.id || me?.id || null);
         setRole(me?.profile?.role || me?.role || null);
-      } catch {}
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [token, profileId, role]);
-
-  // 3) Ambil booking milik user login saja
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      if (!token || !profileId || !role) return;
-      setLoading(true);
-
-      try {
-        const whoKey = role === "mua" ? "mua_id" : "customer_id";
-        const url = `${API}/bookings?${whoKey}=${encodeURIComponent(profileId)}&status=confirmed&per_page=50`;
-
-        const res = await fetch(url, {
-          headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-        });
-
-        const json = await res.json();
-        const list: BookingApi[] = json?.data ?? json ?? [];
-
-        const mapped: Row[] = list.map((b) => ({
-          id: b.id,
-          title: b?.offering?.name_offer || "Booking",
-          date: (b.booking_date || "").slice(0, 10),
-          time: b.booking_time || "--:--",
-          customer: b?.customer?.name,
-          status: b?.status ?? null,          // ← status utama
-          job_status: b?.job_status ?? null,  // ← status pekerjaan
-        }));
-
-        if (!alive) return;
-        setRows(mapped);
-      } catch {
-        if (!alive) return;
-        setRows([]);
-      } finally {
-        if (alive) setLoading(false);
+      } catch (err) {
+        // jika me() gagal, tetap lanjut dan tampilkan pesan kosong nanti
+        console.warn("api.me() failed:", err);
       }
     })();
     return () => {
       alive = false;
     };
-  }, [token, profileId, role]);
+  }, [profileId, role]);
+
+  const fetchBookings = useCallback(async () => {
+    if (!profileId || !role) return;
+    setLoading(true);
+    setErrorText(null);
+    try {
+      const params: any = { per_page: 50, status: "confirmed" };
+      if (role === "mua") params.mua_id = profileId;
+      else params.customer_id = profileId;
+
+      const res = await api.bookings.list(params);
+      // res might be paginated: { data: [...] } or just array
+      const list: BookingApi[] = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : res?.data ?? [];
+
+      const mapped: Row[] = list.map((b: any) => ({
+        id: b.id,
+        title: b?.offering?.name_offer || b?.title || "Booking",
+        date: (b.booking_date || b?.date || "").slice(0, 10),
+        time: b.booking_time || b?.time || "--:--",
+        customer: b?.customer?.name || b?.customer_name || undefined,
+        status: b?.status ?? null,
+        job_status: b?.job_status ?? null,
+      }));
+
+      setRows(mapped);
+    } catch (err: any) {
+      console.error("fetchBookings error:", err);
+      setRows([]);
+      setErrorText(err?.message || "Gagal memuat booking.");
+    } finally {
+      setLoading(false);
+    }
+  }, [profileId, role]);
+
+  useEffect(() => {
+    if (profileId && role) fetchBookings();
+  }, [profileId, role, fetchBookings]);
+
+  useFocusEffect(
+    useCallback(() => {
+      // refresh ringan saat screen fokus (misal setelah create/edit)
+      if (profileId && role) fetchBookings();
+    }, [profileId, role, fetchBookings])
+  );
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchBookings();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchBookings]);
 
   if (loading) {
     return (
@@ -145,46 +166,65 @@ export default function MuaBookingsAccepted() {
   return (
     <View style={styles.screen}>
       <Text style={styles.title}>Bookings Diterima</Text>
-      <FlatList
-        data={rows}
-        keyExtractor={(it) => String(it.id)}
-        contentContainerStyle={{ padding: 16 }}
-        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            onPress={() =>
-              router.push({
-                pathname: "/(mua)/bookings/[id]",
-                params: { id: String(item.id) },
-              })
-            }
-            style={styles.card}
-          >
-            <View style={{ flex: 1 }}>
-              <Text style={styles.cardTitle} numberOfLines={1}>
-                {item.title}
-              </Text>
-              <Text style={styles.meta}>
-                {item.date} • {item.time}
-              </Text>
-              {item.customer ? (
-                <Text style={styles.meta}>Customer: {item.customer}</Text>
-              ) : null}
 
-              {/* Badge status */}
-              <View style={{ flexDirection: "row", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-                {item.status ? <StatusPill label={item.status} /> : null}
-              </View>
-            </View>
-            <Ionicons name="chevron-forward" size={18} color="#6B7280" />
-          </TouchableOpacity>
-        )}
-        ListEmptyComponent={
-          <Text style={{ color: "#6B7280", padding: 16 }}>
-            Belum ada booking diterima.
+      {errorText ? (
+        <View style={styles.center}>
+          <Text style={{ color: "crimson", textAlign: "center", paddingHorizontal: 16 }}>
+            {errorText}
           </Text>
-        }
-      />
+          <TouchableOpacity style={[styles.addBtn, { marginTop: 12 }]} onPress={fetchBookings}>
+            <Ionicons name="refresh" size={18} color="#fff" />
+            <Text style={{ color: "#fff", fontWeight: "800", marginLeft: 6 }}>Coba Lagi</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <FlatList
+          data={rows}
+          keyExtractor={(it) => String(it.id)}
+          contentContainerStyle={{ padding: 16 }}
+          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              onPress={() =>
+                router.push({
+                  pathname: "/(mua)/bookings/[id]",
+                  params: { id: String(item.id) },
+                })
+              }
+              style={styles.card}
+            >
+              <View style={{ flex: 1 }}>
+                <Text style={styles.cardTitle} numberOfLines={1}>
+                  {item.title}
+                </Text>
+                <Text style={styles.meta}>
+                  {item.date} • {item.time}
+                </Text>
+                {item.customer ? <Text style={styles.meta}>Customer: {item.customer}</Text> : null}
+
+                <View style={{ flexDirection: "row", marginTop: 8, flexWrap: "wrap" }}>
+                  {item.status ? (
+                    <View style={{ marginRight: 8 }}>
+                      <StatusPill label={item.status} />
+                    </View>
+                  ) : null}
+                  {item.job_status ? (
+                    <View style={{ marginRight: 8 }}>
+                      <StatusPill label={item.job_status} />
+                    </View>
+                  ) : null}
+                </View>
+              </View>
+
+              <Ionicons name="chevron-forward" size={18} color="#6B7280" />
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            <Text style={{ color: "#6B7280", padding: 16 }}>Belum ada booking diterima.</Text>
+          }
+        />
+      )}
     </View>
   );
 }
@@ -209,5 +249,13 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     paddingHorizontal: 10,
     borderRadius: 999,
+  },
+  addBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: PURPLE,
+    paddingHorizontal: 12,
+    height: 38,
+    borderRadius: 10,
   },
 });

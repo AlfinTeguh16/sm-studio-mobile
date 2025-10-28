@@ -16,7 +16,8 @@ import { useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import Svg, { Path, Defs, LinearGradient as SvgGrad, Stop, Rect } from "react-native-svg";
 import { ensureLocationPermission } from "../../../src/permissions";
-
+import { getAuthToken } from "../../../utils/authStorage";
+import { api } from "../../../lib/api";
 
 /* ================== Types ================== */
 type Me = {
@@ -46,11 +47,10 @@ type Portfolio = {
 type SparkDatum = number;
 
 /* ================== Const ================== */
-const API = "https://smstudio.my.id/api";
-const BASE = API.replace(/\/api$/, ""); // => https://smstudio.my.id
-const API_ME = `${API}/auth/me`;
-const API_BOOKINGS = `${API}/bookings`; // <-- sumber kebenaran tunggal
-const API_PORTFOLIOS = `${API}/portfolios`;
+const BASE_URL = "https://smstudio.my.id/api";
+const API_URL = `${BASE_URL}/api`;
+const API_BOOKINGS = `${API_URL}/bookings`;
+const API_PORTFOLIOS = `${API_URL}/portfolios`;
 
 const PURPLE = "#AA60C8";
 const PURPLE_2 = "#C084FC";
@@ -83,7 +83,7 @@ const monthFromUpdatedOrBooking = (b: Booking): number | null => {
 const normPhoto = (u?: string | null) => {
   if (!u) return null;
   if (u.startsWith("http://") || u.startsWith("https://")) return u;
-  if (u.startsWith("/")) return `${BASE}${u}`;
+  if (u.startsWith("/")) return `${BASE_URL}${u}`;
   return u;
 };
 
@@ -147,29 +147,24 @@ export default function MuaDashboard() {
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
-          const id = auth?.profile?.id || auth?.user?.id;
-          const name = auth?.profile?.name || auth?.user?.name;
-          if (id) setMe({ id, name });
+        const token = await getAuthToken();
+        if (token) {
+          setToken(token);
+          // Ambil data user dari API
+          const response = await api.me();
+          console.log("ME response:", response); // Untuk debugging
+          if (response) {
+            // Coba ambil ID dan nama dari berbagai kemungkinan struktur response
+            const id = response.profile?.id || response.id || response.user?.id || response.data?.id;
+            const name = response.profile?.name || response.name || response.user?.name || response.data?.name;
+            if (id) setMe({ id, name });
+          }
         }
-      } catch {}
-      // fallback /auth/me bila id belum ada
-      try {
-        const res = await fetch(API_ME, {
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        });
-        if (res.ok) {
-          const m: Me = await res.json();
-          const id = m.profile?.id || m.id;
-          const name = m.profile?.name || m.name;
-          setMe((s) => ({ id: s.id ?? id, name: s.name ?? name }));
-        }
-      } catch {}
+      } catch (error) {
+        console.warn("Error fetching user data:", error);
+      }
     })();
-  }, [token]);
+  }, []);
 
   // fetch SEMUA bookings via /api/bookings (paginate until done) -> filter by mua_id & completed di server
   useEffect(() => {
@@ -199,8 +194,8 @@ export default function MuaDashboard() {
           const pageData: Booking[] = Array.isArray(json?.data)
             ? (json.data as Booking[])
             : Array.isArray(json)
-            ? (json as Booking[])
-            : [];
+              ? (json as Booking[])
+              : [];
 
           all = all.concat(pageData);
 
@@ -309,13 +304,13 @@ export default function MuaDashboard() {
   }, [bookings, me.id]);
 
   /* ------------------ Fetch helpers ------------------ */
-  const [coords, setCoords] = useState<{lat:number; lng:number} | null>(null);
+  const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
 
   async function onGetLocation() {
     try {
       const pos = await ensureLocationPermission();
       setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-    } catch (e:any) {
+    } catch (e: any) {
       Alert.alert("Izin Dibutuhkan", e?.message || "Gagal mengambil lokasi.");
     }
   }
@@ -324,7 +319,7 @@ export default function MuaDashboard() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 24 }}>
-     
+
       {/* Header */}
       <View style={styles.header}>
         <View>

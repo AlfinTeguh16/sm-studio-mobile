@@ -1,45 +1,51 @@
 // utils/migrateAuth.ts
 import * as SecureStore from "expo-secure-store";
-import { setAuthToken, setRefreshToken, setUserProfile } from "./authStorage";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { setAuthToken, setUserProfile, getAuthToken, getUserProfile } from "./authStorage";
 
-const OLD_KEY = "auth"; // kunci lama yang mungkin menyimpan objek besar
+const LEGACY_KEY = "auth"; // key lama yang dipakai sebelumnya in repo
 
-export async function migrateAuthIfNeeded() {
+export async function migrateAuthIfNeeded(): Promise<{ migrated: boolean; reason?: string }>{
   try {
-    const raw = await SecureStore.getItemAsync(OLD_KEY);
-    if (!raw) {
-      // nothing to migrate
-      return;
+    // 1) check SecureStore legacy key
+    const legacySecure = await SecureStore.getItemAsync(LEGACY_KEY);
+    if (legacySecure) {
+      try {
+        const parsed = JSON.parse(legacySecure);
+        const token = parsed?.token ?? parsed?.authToken ?? null;
+        const profile = parsed?.profile ?? parsed?.user ?? null;
+
+        if (token) await setAuthToken(token);
+        if (profile) await setUserProfile(profile);
+        // remove legacy
+        await SecureStore.deleteItemAsync(LEGACY_KEY).catch(()=>{});
+        return { migrated: true, reason: "migrated secureStore auth" };
+      } catch (e) {
+        // ignore json parse error, continue to check AsyncStorage legacy
+      }
     }
 
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (err) {
-      // tidak JSON -> tidak bisa diinterpretasi, hapus saja untuk mencegah warning selanjutnya
-      console.warn("migrateAuth: old 'auth' not json, deleting old key");
-      await SecureStore.deleteItemAsync(OLD_KEY).catch(()=>{});
-      return;
+    // 2) check AsyncStorage legacy key (some versions used AsyncStorage for 'auth')
+    const legacyAsync = await AsyncStorage.getItem(LEGACY_KEY);
+    if (legacyAsync) {
+      try {
+        const parsed = JSON.parse(legacyAsync);
+        const token = parsed?.token ?? parsed?.authToken ?? null;
+        const profile = parsed?.profile ?? parsed?.user ?? null;
+
+        if (token) await setAuthToken(token);
+        if (profile) await setUserProfile(profile);
+        await AsyncStorage.removeItem(LEGACY_KEY).catch(()=>{});
+        return { migrated: true, reason: "migrated asyncStorage auth" };
+      } catch (e) {
+        // ignore
+      }
     }
 
-    // parsed mungkin berbentuk: { token, refresh_token, profile, user, ... }
-    if (parsed?.token && typeof parsed.token === "string") {
-      await setAuthToken(parsed.token);
-    }
-    if (parsed?.refresh_token && typeof parsed.refresh_token === "string") {
-      await setRefreshToken(parsed.refresh_token);
-    }
-
-    // profile/user bisa besar — pindahkan ke AsyncStorage via setUserProfile
-    const profile = parsed?.profile ?? parsed?.user ?? null;
-    if (profile) {
-      await setUserProfile(profile);
-    }
-
-    // setelah sukses, hapus kunci lama supaya tidak terus memicu warning
-    await SecureStore.deleteItemAsync(OLD_KEY).catch(()=>{});
-    console.log("migrateAuthIfNeeded: migrated and removed old 'auth' key");
-  } catch (e) {
-    console.warn("migrateAuthIfNeeded failed:", e);
+    // nothing to do
+    return { migrated: false, reason: "nothing to migrate" };
+  } catch (ex) {
+    console.warn("migrateAuthIfNeeded failed", ex);
+    return { migrated: false, reason: String(ex) };
   }
 }
