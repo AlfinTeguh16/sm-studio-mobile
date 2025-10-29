@@ -1,3 +1,4 @@
+// app/(mua)/offerings/new.tsx
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import {
   View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity,
@@ -11,6 +12,8 @@ import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as FileSystem from "expo-file-system";
 
+// gunakan utils/authStorage yang sudah kamu punya (sesuaikan path jika berbeda)
+import authStorage from "../../../utils/authStorage";
 
 const API = "https://smstudio.my.id/api";
 const PURPLE = "#AA60C8";
@@ -21,6 +24,7 @@ const TEXT_MUTED = "#6B7280";
 type Me = { id?: string; profile?: { id?: string } };
 type LocalImage = { uri: string; name: string; type: string };
 
+// helpers
 function toYMD(d: Date) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 }
@@ -28,12 +32,21 @@ const isContentUri = (uri: string) => uri.startsWith("content://");
 
 /** Kompres ringan (resize width max 1600, jpeg 0.8) */
 async function compressImage(uri: string): Promise<LocalImage> {
-  const out = await ImageManipulator.manipulateAsync(
-    uri,
-    [{ resize: { width: 1600 } }],
-    { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
-  );
-  return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
+  // ImageManipulator kadang gagal pada content:// URIs di Android.
+  // Jika gagal, fallback kembalikan uri asli (server biasanya menerima).
+  try {
+    const out = await ImageManipulator.manipulateAsync(
+      uri,
+      [{ resize: { width: 1600 } }],
+      { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+    );
+    return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
+  } catch (e) {
+    console.warn("compressImage failed, fallback to original uri", e);
+    const ext = (uri.split(".").pop() || "jpg").split(/\?|#/)[0];
+    const type = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+    return { uri, name: `photo_${Date.now()}.${ext}`, type };
+  }
 }
 
 /** Upload via fetch (FormData, multi file) */
@@ -43,16 +56,16 @@ async function uploadWithFetch(offeringId: string, token: string, files: LocalIm
   files.forEach((f) => {
     (fd as any).append("offer_images[]", { uri: f.uri, name: f.name, type: f.type } as any);
   });
+
   const res = await fetch(`${API}/offerings/${encodeURIComponent(offeringId)}`, {
     method: "POST",
-    headers: { Accept: "application/json", Authorization: `Bearer ${token}` }, // <== TANPA Content-Type
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` }, // jangan set Content-Type
     body: fd as any,
   });
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(j?.message || j?.error || "Upload foto gagal.");
+  if (!res.ok) throw new Error(j?.message || j?.error || `Upload foto gagal (status ${res.status})`);
   return j;
 }
-
 
 const MULTIPART: any =
   (FileSystem as any)?.FileSystemUploadType?.MULTIPART ??
@@ -61,14 +74,16 @@ const MULTIPART: any =
 
 async function uploadWithUploadAsync(offeringId: string, token: string, files: { uri: string; name: string; type: string }[]) {
   const url = `${API}/offerings/${encodeURIComponent(offeringId)}?_method=PATCH`;
+
+  // When using uploadAsync we send files one-by-one (server should accept array fieldName same per-file)
   for (const f of files) {
     const res = await FileSystem.uploadAsync(url, f.uri, {
       httpMethod: "POST",
       headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-      uploadType: MULTIPART,     
+      uploadType: MULTIPART,
       fieldName: "offer_images[]",
       mimeType: f.type,
-      parameters: {},                  // tambahkan fields lain jika perlu
+      parameters: {}, // bisa tambahkan fields lain jika perlu
     });
 
     if (res.status < 200 || res.status >= 300) {
@@ -76,8 +91,6 @@ async function uploadWithUploadAsync(offeringId: string, token: string, files: {
     }
   }
 }
-
-
 
 export default function OfferingCreate() {
   const router = useRouter();
@@ -104,33 +117,70 @@ export default function OfferingCreate() {
   const [submitting, setSubmitting] = useState(false);
   const [uploading, setUploading] = useState(false);
 
-  useEffect(()=>{ (async ()=>{
-    try {
-      const raw = await SecureStore.getItemAsync("auth").catch(()=>null);
-      if (raw) {
-        const auth = JSON.parse(raw);
-        if (auth?.token) setToken(auth.token);
-        const id = auth?.profile?.id || auth?.user?.id;
-        if (id) setMuaId(String(id));
-      }
-    } catch {}
-  })(); }, []);
+  // load token + profile robustly
+  useEffect(()=> {
+    (async ()=>{
+      try {
+        // try authStorage helper first (recommended)
+        const t = await authStorage.getAuthToken().catch(()=>null);
+        if (t) setToken(t);
 
-  useEffect(()=>{ (async ()=>{
-    if (!muaId && token) {
+        // try profile via authStorage
+        const p = await authStorage.getUserProfile().catch(()=>null);
+        if (p?.id) {
+          setMuaId(String(p.id));
+          return;
+        }
+
+        // fallback: legacy SecureStore "auth" object
+        const raw = await SecureStore.getItemAsync("auth").catch(()=>null);
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            const candidateToken = parsed?.token ?? parsed?.access_token ?? parsed?.data?.token ?? null;
+            if (!t && candidateToken) setToken(candidateToken);
+            const pid = parsed?.profile?.id ?? parsed?.user?.profile?.id ?? parsed?.user?.id ?? parsed?.profile_id ?? null;
+            if (pid) setMuaId(String(pid));
+          } catch (err) {
+            console.warn("Failed parse SecureStore auth:", err);
+          }
+        }
+      } catch (e) {
+        console.warn("Auth load error:", e);
+      }
+    })();
+  }, []);
+
+  // If token exists but muaId still missing, call /auth/me once
+  useEffect(()=> {
+    (async ()=>{
+      if (!token) return;
+      if (muaId) return;
       try {
         const res = await fetch(`${API}/auth/me`, {
-          headers: { Accept:"application/json", Authorization:`Bearer ${token}` },
+          headers: { Accept: "application/json", Authorization:`Bearer ${token}` },
         });
-        if (res.ok) {
-          const me: Me = await res.json();
-          const id = me?.profile?.id || me?.id;
-          if (id) setMuaId(String(id));
+        if (!res.ok) {
+          if (res.status === 401) {
+            // token invalid: clear and redirect
+            await authStorage.clearAuthAll().catch(()=>{});
+            setToken(null);
+            setMuaId(null);
+            Alert.alert("Sesi berakhir", "Silakan login kembali.", [{ text:"OK", onPress: ()=> router.push("/(auth)/login") }]);
+            return;
+          }
+          return;
         }
-      } catch {}
-    }
-  })(); }, [token, muaId]);
+        const me: Me = await res.json().catch(()=>({}));
+        const id = me?.profile?.id || me?.id;
+        if (id) setMuaId(String(id));
+      } catch (e) {
+        console.warn("fetch /auth/me failed", e);
+      }
+    })();
+  }, [token, muaId, router]);
 
+  // image picker
   const pickImages = useCallback(async ()=>{
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status!=="granted") { Alert.alert("Izin dibutuhkan","Izinkan akses galeri."); return; }
@@ -141,16 +191,17 @@ export default function OfferingCreate() {
 
     const mapped:LocalImage[] = (result.assets||[]).slice(0,10).map((a,i)=>{
       const name = a.fileName || `photo_${Date.now()}_${i}.${(a.uri.split(".").pop()||"jpg").replace(/\?.*$/,"")}`;
-      const type = a.mimeType || (name.toLowerCase().endsWith(".png")?"image/png":name.toLowerCase().endsWith(".webp")?"image/webp":"image/jpeg");
+      const type = a.type ? (a.type === "image" ? (a.uri.endsWith(".png") ? "image/png" : "image/jpeg") : "image/jpeg") : (name.toLowerCase().endsWith(".png")?"image/png":name.toLowerCase().endsWith(".webp")?"image/webp":"image/jpeg");
       return { uri:a.uri, name, type };
     });
     setLocalImages(prev => [...prev, ...mapped].slice(0,50));
   },[]);
+
   const removeLocalImage = (idx:number)=> setLocalImages(prev=>prev.filter((_,i)=>i!==idx));
 
   async function submit() {
     try {
-      if (!muaId) throw new Error("Akun MUA belum terdeteksi.");
+      if (!muaId) throw new Error("Akun MUA belum terdeteksi. Pastikan Anda sudah login.");
       if (!nameOffer.trim()) throw new Error("Nama paket wajib diisi.");
       if (!priceNum || priceNum<=0) throw new Error("Harga tidak valid.");
       if (person<1) throw new Error("Jumlah orang minimal 1.");
@@ -174,31 +225,55 @@ export default function OfferingCreate() {
         headers: { "Content-Type":"application/json", Accept:"application/json", ...(token?{Authorization:`Bearer ${token}`}:{}) },
         body: JSON.stringify(payload),
       });
-      const created = await res.json().catch(()=> ({}));
-      if (!res.ok) throw new Error(created?.message || created?.error || "Gagal menyimpan offering.");
 
-      const newId = String(created?.id || created?.data?.id || "");
-      if (!newId) { Alert.alert("Berhasil","Offering dibuat."); return; }
+      const created = await res.json().catch(()=> ({}));
+      if (!res.ok) {
+        // jika 401 -> hapus auth & redirect
+        if (res.status === 401) {
+          await authStorage.clearAuthAll().catch(()=>{});
+          Alert.alert("Sesi berakhir", "Silakan login kembali.", [{ text:"OK", onPress: ()=> router.push("/(auth)/login") }]);
+          return;
+        }
+        throw new Error(created?.message || created?.error || "Gagal menyimpan offering.");
+      }
+
+      // backend bisa mengembalikan { id } atau { data: { id } } atau { data: { ... } }
+      const newId = String(created?.id ?? created?.data?.id ?? created?.data?.id ?? "");
+      if (!newId) {
+        // berhasil tapi id tidak ditemukan — tetap beri notifikasi dan kembali
+        Alert.alert("Berhasil", "Offering dibuat, tapi ID respons tidak ditemukan. Refresh daftar untuk melihat perubahan.", [
+          { text: "OK", onPress: ()=> router.back() }
+        ]);
+        return;
+      }
 
       // Upload foto jika ada
       if (localImages.length>0 && token) {
         setUploading(true);
 
-        // Kompres semua dulu
+        // Kompres semua dulu (toleran content://)
         const compressed: LocalImage[] = [];
         for (const f of localImages) {
-          // kompres hanya jika bukan jpeg atau tanpa extensi jelas
           const c = await compressImage(f.uri);
-          compressed.push({ ...c, name: f.name.endsWith(".jpg")||f.name.endsWith(".jpeg")? f.name : c.name });
+          // preserve original name if it already ends with jpg/jpeg
+          const name = f.name && (f.name.toLowerCase().endsWith(".jpg") || f.name.toLowerCase().endsWith(".jpeg")) ? f.name : c.name;
+          compressed.push({ ...c, name });
         }
 
+        // jika ada content:// uri di Android, gunakan uploadAsync per-file (kadang FormData gagal)
         const hasContent = Platform.OS === "android" && compressed.some((f)=>isContentUri(f.uri));
-        if (hasContent) {
-          // Fallback per file
-          await uploadWithUploadAsync(newId, token, compressed);
-        } else {
-          // Multi file sekali kirim
-          await uploadWithFetch(newId, token, compressed);
+        try {
+          if (hasContent) {
+            await uploadWithUploadAsync(newId, token, compressed);
+          } else {
+            await uploadWithFetch(newId, token, compressed);
+          }
+        } catch (e:any) {
+          console.warn("Upload photos failed:", e);
+          // jangan gagalkan seluruh proses buat; beri pesan tapi tetap arahkan ke detail
+          Alert.alert("Peringatan", "Offering dibuat, tetapi unggah foto gagal: " + (e?.message || ""));
+        } finally {
+          setUploading(false);
         }
       }
 

@@ -10,6 +10,10 @@ import * as SecureStore from "expo-secure-store";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
+import * as FileSystem from "expo-file-system";
+
+// gunakan authStorage (jika ada). kalau path beda, sesuaikan.
+import authStorage from "../../../../utils/authStorage";
 
 const API = "https://smstudio.my.id/api";
 const BASE = API.replace(/\/api$/, "");
@@ -40,13 +44,64 @@ function toYMD(d: Date) {
   ).padStart(2, "0")}`;
 }
 
+const MULTIPART: any =
+  (FileSystem as any)?.FileSystemUploadType?.MULTIPART ??
+  (FileSystem as any)?.UploadType?.MULTIPART ??
+  "multipart";
+
+const isContentUri = (uri: string) => uri.startsWith("content://");
+
 async function compressImage(uri: string): Promise<LocalImage> {
-  const out = await ImageManipulator.manipulateAsync(
-    uri,
-    [{ resize: { width: 1600 } }],
-    { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+  try {
+    const out = await ImageManipulator.manipulateAsync(
+      uri,
+      [{ resize: { width: 1600 } }],
+      { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+    );
+    return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
+  } catch (e) {
+    // fallback: return original
+    const ext = (uri.split(".").pop() || "jpg").split(/\?|#/)[0];
+    const type = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+    return { uri, name: `photo_${Date.now()}.${ext}`, type };
+  }
+}
+
+async function uploadWithFetch(offeringId: string, token: string, files: LocalImage[]) {
+  const fd = new FormData();
+  (fd as any).append("_method", "PATCH");
+  files.forEach((f) =>
+    (fd as any).append("offer_images[]", { uri: f.uri, name: f.name, type: f.type } as any)
   );
-  return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
+
+  const res = await fetch(`${API}/offerings/${encodeURIComponent(offeringId)}`, {
+    method: "POST",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` }, // do not set Content-Type
+    body: fd as any,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j?.message || j?.error || `Upload foto gagal (status ${res.status})`);
+  return j;
+}
+
+async function uploadWithUploadAsync(offeringId: string, token: string, files: LocalImage[]) {
+  const url = `${API}/offerings/${encodeURIComponent(offeringId)}?_method=PATCH`;
+
+  // upload files one-by-one (server should accept repeated fieldName)
+  for (const f of files) {
+    const res = await FileSystem.uploadAsync(url, f.uri, {
+      httpMethod: "POST",
+      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+      uploadType: MULTIPART,
+      fieldName: "offer_images[]",
+      mimeType: f.type,
+      parameters: {},
+    });
+
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`Upload gagal (${res.status}): ${res.body || ""}`);
+    }
+  }
 }
 
 export default function OfferingEdit() {
@@ -54,6 +109,7 @@ export default function OfferingEdit() {
   const router = useRouter();
 
   const [token, setToken] = useState<string | null>(null);
+  const [tokenReady, setTokenReady] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -82,61 +138,78 @@ export default function OfferingEdit() {
   const [addons, setAddons] = useState<string[]>([]);
   const [addonInput, setAddonInput] = useState("");
 
-  // token
+  // load token robustly
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
+        // prefer authStorage if present
+        const t1 = await authStorage.getAuthToken().catch(() => null);
+        if (t1) {
+          setToken(t1);
+        } else {
+          // fallback parse SecureStore 'auth'
+          const raw = await SecureStore.getItemAsync("auth").catch(() => null);
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              const cand = parsed?.token ?? parsed?.access_token ?? parsed?.data?.token ?? null;
+              if (cand) setToken(cand);
+            } catch {}
+          }
         }
-      } catch {}
+      } catch (e) {
+        console.warn("token load failed", e);
+      } finally {
+        setTokenReady(true);
+      }
     })();
   }, []);
 
-  // GET offering & PREFILL
+  // fetch offering detail once tokenReady
   useEffect(() => {
     (async () => {
-      if (!id) return;
-      try {
-        setLoading(true);
-        const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}`, {
-          headers: {
-            Accept: "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-        });
-        const raw = await res.text();
-        if (!res.ok) throw new Error(`HTTP ${res.status} — ${raw.slice(0, 200)}`);
+      if (!tokenReady) return;
+      if (!id) {
+        setLoading(false);
+        return;
+      }
 
-        let j: any;
-        try { j = JSON.parse(raw); } catch { j = {}; }
+      setLoading(true);
+      try {
+        const headers: Record<string, string> = { Accept: "application/json" };
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}`, { headers });
+        const txt = await res.text();
+        if (!res.ok) {
+          // handle 401
+          if (res.status === 401) {
+            await authStorage.clearAuthAll().catch(() => {});
+            Alert.alert("Sesi berakhir", "Silakan login ulang.", [
+              { text: "OK", onPress: () => router.replace("/(auth)/login") },
+            ]);
+            return;
+          }
+          throw new Error(`HTTP ${res.status} — ${txt.slice(0, 200)}`);
+        }
+
+        let j: any = {};
+        try {
+          j = JSON.parse(txt);
+        } catch {
+          j = {};
+        }
         const data: Offering = j?.data ?? j;
 
-        // PREFILL aman null/undefined
+        // prefill
         setNameOffer(String(data?.name_offer ?? ""));
         setMakeupType((data?.makeup_type as any) || "");
         setPerson(Number(data?.person ?? 1));
-
-        // harga → string angka
-        const priceRaw = data?.price ?? 0;
-        setPriceStr(String(Math.round(Number(priceRaw) || 0)));
-
-        // kolab
+        setPriceStr(String(Math.round(Number(data?.price ?? 0) || 0)));
         setCollabName(String(data?.collaboration ?? ""));
-        setCollabPriceStr(
-          data?.collaboration ? String(Math.round(Number(data?.collaboration_price ?? 0))) : ""
-        );
+        setCollabPriceStr(data?.collaboration ? String(Math.round(Number(data?.collaboration_price ?? 0))) : "");
+        setServerPhotos(Array.isArray(data?.offer_pictures) ? data.offer_pictures! : []);
+        setAddons(Array.isArray(data?.add_ons) ? data.add_ons! : []);
 
-        // foto server
-        const pics = Array.isArray(data?.offer_pictures) ? data!.offer_pictures! : [];
-        setServerPhotos(pics);
-
-        // add-ons
-        setAddons(Array.isArray(data?.add_ons) ? (data!.add_ons as string[]) : []);
-
-        // tanggal
         if (data?.date) {
           const [Y, M, D] = String(data.date).split("-").map((n) => Number(n));
           if (Y && M && D) {
@@ -149,14 +222,14 @@ export default function OfferingEdit() {
           setUseDate(false);
         }
       } catch (e: any) {
-        Alert.alert("Error", e?.message || "Tidak bisa memuat offering.");
+        Alert.alert("Gagal", e?.message || "Tidak bisa memuat offering.");
       } finally {
         setLoading(false);
       }
     })();
-  }, [id, token]);
+  }, [id, token, tokenReady, router]);
 
-  // pilih gambar lokal
+  // image picker
   const pickImages = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -186,10 +259,9 @@ export default function OfferingEdit() {
     });
     setLocalImages((prev) => [...prev, ...mapped].slice(0, 50));
   }, []);
-  const removeLocalImage = (idx: number) =>
-    setLocalImages((prev) => prev.filter((_, i) => i !== idx));
+  const removeLocalImage = (idx: number) => setLocalImages((prev) => prev.filter((_, i) => i !== idx));
 
-  // hapus foto lama di server
+  // delete server pic by index (expects backend handling)
   async function deleteServerPictureByIndex(idx: number) {
     try {
       if (!token) throw new Error("Harap login.");
@@ -205,17 +277,25 @@ export default function OfferingEdit() {
         headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
         body: fd as any,
       });
+
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.message || j?.error || "Gagal menghapus foto.");
+      if (!res.ok) {
+        if (res.status === 401) {
+          await authStorage.clearAuthAll().catch(() => {});
+          Alert.alert("Sesi berakhir", "Silakan login ulang.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+          return;
+        }
+        throw new Error(j?.message || j?.error || "Gagal menghapus foto.");
+      }
+
       const updated: Offering = j?.data ?? j;
-      setServerPhotos(Array.isArray(updated?.offer_pictures) ? (updated!.offer_pictures as string[]) : []);
+      setServerPhotos(Array.isArray(updated?.offer_pictures) ? updated.offer_pictures! : []);
       Alert.alert("Berhasil", "Foto dihapus.");
     } catch (e: any) {
       Alert.alert("Gagal", e?.message || "Tidak bisa menghapus foto.");
     }
   }
 
-  // add-ons
   function addAddon() {
     const v = addonInput.trim();
     if (!v) return;
@@ -226,7 +306,7 @@ export default function OfferingEdit() {
     setAddons((prev) => prev.filter((x) => x !== v));
   }
 
-  // SIMPAN
+  // save (PATCH + optional images)
   async function saveAll() {
     try {
       if (!token) throw new Error("Harap login.");
@@ -239,6 +319,7 @@ export default function OfferingEdit() {
 
       setSaving(true);
 
+      // build FormData
       const fd = new FormData();
       (fd as any).append("_method", "PATCH");
       (fd as any).append("name_offer", nameOffer.trim());
@@ -246,33 +327,38 @@ export default function OfferingEdit() {
       (fd as any).append("person", String(person));
       (fd as any).append("price", String(priceNum));
       (fd as any).append("date", useDate ? toYMD(date) : "");
-
       (fd as any).append("collaboration", collabName.trim());
-      if (collabName.trim())
-        (fd as any).append("collaboration_price", String(collabPriceNum ?? 0));
-
+      if (collabName.trim()) (fd as any).append("collaboration_price", String(collabPriceNum ?? 0));
       addons.forEach((a) => (fd as any).append("add_ons[]", a));
 
+      // compress local images and append
+      const compressed: LocalImage[] = [];
       for (const f of localImages) {
         const c = await compressImage(f.uri);
-        (fd as any).append("offer_images[]", {
-          uri: c.uri,
-          name: f.name.endsWith(".jpg") || f.name.endsWith(".jpeg") ? f.name : c.name,
-          type: "image/jpeg",
-        } as any);
+        const name = f.name && (f.name.toLowerCase().endsWith(".jpg") || f.name.toLowerCase().endsWith(".jpeg")) ? f.name : c.name;
+        compressed.push({ ...c, name });
+        (fd as any).append("offer_images[]", { uri: c.uri, name, type: "image/jpeg" } as any);
       }
 
+      // send request
       const res = await fetch(`${API}/offerings/${encodeURIComponent(String(id))}`, {
-        method: "POST",
+        method: "POST", // using _method=PATCH
         headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
         body: fd as any,
       });
 
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.message || j?.error || "Gagal menyimpan perubahan.");
+      if (!res.ok) {
+        if (res.status === 401) {
+          await authStorage.clearAuthAll().catch(() => {});
+          Alert.alert("Sesi berakhir", "Silakan login ulang.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+          return;
+        }
+        throw new Error(j?.message || j?.error || "Gagal menyimpan perubahan.");
+      }
 
       const updated: Offering = j?.data ?? j;
-      setServerPhotos(Array.isArray(updated?.offer_pictures) ? (updated!.offer_pictures as string[]) : []);
+      setServerPhotos(Array.isArray(updated?.offer_pictures) ? updated.offer_pictures! : []);
       setLocalImages([]);
       Alert.alert("Sukses", "Perubahan disimpan.", [{ text: "OK", onPress: () => router.back() }]);
     } catch (e: any) {
