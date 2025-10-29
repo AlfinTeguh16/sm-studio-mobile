@@ -9,22 +9,24 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
+// optional helper (if exists in your project)
+import { getAuthToken } from "../../../../utils/authStorage";
 
 const API = "https://smstudio.my.id/api";
-const BASE = API.replace(/\/api$/,"");
+const BASE = API.replace(/\/api$/, "");
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const TEXT_MUTED = "#6B7280";
 
 type Portfolio = {
-  id: number|string;
-  mua_id: string;
-  name: string;
+  id: number | string;
+  mua_id?: string;
+  name?: string;
   photos?: string[] | null;
   makeup_type?: string | null;
   collaboration?: string | null;
-  created_at?: string;
-  updated_at?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 type LocalImage = { uri: string; name: string; type: string };
@@ -42,12 +44,45 @@ async function compressImage(uri: string): Promise<LocalImage> {
   return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
 }
 
+/** Helper fetch yang memastikan JSON dan pesan error yang aman */
+async function fetchJsonChecked(url: string, opts: RequestInit = {}) {
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+
+  if (!ct.includes("application/json")) {
+    const snippet = text ? text.slice(0, 400) : "";
+    const e: any = new Error(`Response bukan JSON: ${snippet}`);
+    e.status = res.status;
+    throw e;
+  }
+
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    const e: any = new Error("Gagal parsing JSON dari server.");
+    e.status = res.status;
+    throw e;
+  }
+
+  if (!res.ok) {
+    const msg = json?.message || json?.error || `HTTP ${res.status}`;
+    const e: any = new Error(msg);
+    e.status = res.status;
+    throw e;
+  }
+
+  return json;
+}
+
 export default function PortfolioEdit() {
   const router = useRouter();
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id } = useLocalSearchParams<{ id?: string }>();
 
   // auth
-  const [token, setToken] = useState<string|null>(null);
+  const [token, setToken] = useState<string | null>(null);
+  const [tokenReady, setTokenReady] = useState(false);
 
   // loading flags
   const [loading, setLoading] = useState(true);
@@ -61,81 +96,121 @@ export default function PortfolioEdit() {
   const [serverPhotos, setServerPhotos] = useState<string[]>([]);
   const [localImages, setLocalImages] = useState<LocalImage[]>([]);
 
-  // get token
+  // bootstrap token: try getAuthToken() first then SecureStore
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
+        let t: string | null = null;
+        if (typeof getAuthToken === "function") {
+          try { t = await getAuthToken(); } catch {}
         }
-      } catch {}
+        if (!t) {
+          const raw = await SecureStore.getItemAsync("auth");
+          if (raw) {
+            try {
+              const auth = JSON.parse(raw);
+              t = auth?.token ?? auth?.accessToken ?? auth?.access_token ?? null;
+            } catch {}
+          }
+        }
+        if (t) setToken(String(t));
+      } catch (e) {
+        console.warn("bootstrap token failed:", e);
+      } finally {
+        setTokenReady(true);
+      }
     })();
   }, []);
 
-  // fetch portfolio
+  // fetch portfolio (wait tokenReady to avoid premature unauthenticated requests)
   useEffect(() => {
-    if (!id) return;
+    if (!tokenReady) return;
+    if (!id) {
+      setLoading(false);
+      return;
+    }
+
     (async () => {
+      setLoading(true);
       try {
-        setLoading(true);
-        const res = await fetch(`${API}/portfolios/${encodeURIComponent(String(id))}`, {
-          headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        });
+        const url = `${API}/portfolios/${encodeURIComponent(String(id))}`;
+        const headers: Record<string, string> = { Accept: "application/json" };
+        if (token) headers.Authorization = `Bearer ${token}`;
 
-        const json = await res.json().catch(()=> ({}));
-        if (!res.ok) {
-          const msg = json?.message || `Gagal memuat (status ${res.status})`;
-          throw new Error(msg);
+        // try with token (if present), fallback without token for public resources
+        try {
+          const json = await fetchJsonChecked(url, { headers });
+          const p: Portfolio = json?.data ?? json;
+          setName(p?.name ?? "");
+          setMakeupType(p?.makeup_type ?? "");
+          setCollab(p?.collaboration ?? "");
+          setServerPhotos(Array.isArray(p?.photos) ? p.photos.filter(Boolean) as string[] : []);
+        } catch (e: any) {
+          if (e?.status === 401) {
+            // session expired — clear auth, force login
+            await SecureStore.deleteItemAsync("auth").catch(()=>{});
+            Alert.alert("Sesi Berakhir", "Silakan login kembali.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+            return;
+          }
+          // fallback: try unauthenticated GET (in case resource is public)
+          try {
+            const json = await fetchJsonChecked(`${API}/portfolios/${encodeURIComponent(String(id))}`, { headers: { Accept: "application/json" } });
+            const p: Portfolio = json?.data ?? json;
+            setName(p?.name ?? "");
+            setMakeupType(p?.makeup_type ?? "");
+            setCollab(p?.collaboration ?? "");
+            setServerPhotos(Array.isArray(p?.photos) ? p.photos.filter(Boolean) as string[] : []);
+          } catch (err) {
+            throw err;
+          }
         }
-
-        const p: Portfolio = json?.data ?? json;
-        setName(p?.name ?? "");
-        setMakeupType(p?.makeup_type ?? "");
-        setCollab(p?.collaboration ?? "");
-        setServerPhotos(Array.isArray(p?.photos) ? p.photos.filter(Boolean) as string[] : []);
       } catch (e: any) {
+        console.warn("Failed to load portfolio:", e);
         Alert.alert("Gagal", e?.message || "Tidak bisa memuat portofolio.");
       } finally {
         setLoading(false);
       }
     })();
-  }, [id, token]);
+  }, [id, token, tokenReady, router]);
 
   // pick images
   const pickImages = useCallback(async () => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== "granted") {
-      Alert.alert("Izin diperlukan", "Izinkan akses galeri untuk menambahkan foto.");
-      return;
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert("Izin diperlukan", "Izinkan akses galeri untuk menambahkan foto.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        allowsMultipleSelection: true,
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 1,
+        selectionLimit: 10,
+      });
+      if (result.canceled) return;
+
+      const mapped: LocalImage[] = (result.assets || []).slice(0, 10).map((a, i) => {
+        const ext = (a.uri.split(".").pop() || "jpg").replace(/\?.*$/, "").toLowerCase();
+        const name = a.fileName || `photo_${Date.now()}_${i}.${ext}`;
+        const type = a.mimeType || (ext === "png" ? "image/png" : "image/jpeg");
+        return { uri: a.uri, name, type };
+      });
+
+      setLocalImages(prev => [...prev, ...mapped].slice(0, 50));
+    } catch (e: any) {
+      console.warn("pickImages error:", e);
+      Alert.alert("Gagal", "Tidak dapat memilih gambar.");
     }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      allowsMultipleSelection: true,
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 1,
-      selectionLimit: 10,
-    });
-    if (result.canceled) return;
-
-    const mapped: LocalImage[] = (result.assets || []).slice(0,10).map((a,i) => {
-      const ext = (a.uri.split(".").pop() || "jpg").replace(/\?.*$/,"").toLowerCase();
-      const name = a.fileName || `photo_${Date.now()}_${i}.${ext}`;
-      const type = a.mimeType || (ext === "png" ? "image/png" : "image/jpeg");
-      return { uri: a.uri, name, type };
-    });
-
-    setLocalImages(prev => [...prev, ...mapped].slice(0, 50));
   }, []);
 
   // remove local draft image
   const removeLocalImage = (idx: number) => {
-    setLocalImages(prev => prev.filter((_,i)=>i!==idx));
+    setLocalImages(prev => prev.filter((_, i) => i !== idx));
   };
 
-  // remove server photo from list (FE only; akan di-REPLACE saat simpan)
+  // remove server photo from list (FE only; it will be sent as kept list on save)
   const removeServerPhoto = (idx: number) => {
-    setServerPhotos(prev => prev.filter((_,i)=>i!==idx));
+    setServerPhotos(prev => prev.filter((_, i) => i !== idx));
   };
 
   // SIMPAN: kirim field + (URL foto yang dipertahankan) + file baru sekaligus
@@ -148,16 +223,15 @@ export default function PortfolioEdit() {
       setSaving(true);
 
       const fd = new FormData();
-      (fd as any).append("_method", "PATCH"); // Laravel
+      (fd as any).append("_method", "PATCH"); // Laravel expects POST+_method
       (fd as any).append("name", name.trim());
       (fd as any).append("makeup_type", makeupType.trim());
       (fd as any).append("collaboration", collab.trim());
 
-      // Kirim daftar foto server yang ingin dipertahankan (mode replace)
-      // Controller sebaiknya support: jika 'photos' ada → replace seluruh array
-      serverPhotos.forEach((url) => (fd as any).append("photos[]", url));
+      // Kirim URL foto yang mau dipertahankan (server harus mendukung photos[] sebagai array URL)
+      serverPhotos.forEach((url) => (fd as any).append("photos[]", String(url)));
 
-      // Kompres semua file lokal, lalu lampirkan
+      // Kompres setiap file lokal & lampirkan
       for (const f of localImages) {
         const c = await compressImage(f.uri);
         (fd as any).append("photos[]", {
@@ -172,24 +246,31 @@ export default function PortfolioEdit() {
         headers: {
           Accept: "application/json",
           Authorization: `Bearer ${token}`,
-          // JANGAN set "Content-Type" manual
+          // Jangan set "Content-Type" — fetch akan atur multipart boundary otomatis
         },
         body: fd as any,
       });
 
-      const j = await res.json().catch(()=> ({}));
+      // parse safe
+      const text = await res.text();
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const snippet = text ? text.slice(0, 500) : "";
+        throw new Error(`Response bukan JSON: ${snippet}`);
+      }
+      const j = JSON.parse(text);
+
       if (!res.ok) {
         const msg = j?.message || j?.error || `Gagal menyimpan (status ${res.status})`;
         throw new Error(msg);
       }
 
       const updated: Portfolio = j?.data ?? j;
-      setServerPhotos(Array.isArray(updated?.photos) ? updated.photos : []);
+      setServerPhotos(Array.isArray(updated?.photos) ? updated.photos.filter(Boolean) as string[] : []);
       setLocalImages([]);
-      Alert.alert("Berhasil", "Perubahan disimpan.", [
-        { text: "OK", onPress: () => router.back() },
-      ]);
+      Alert.alert("Berhasil", "Perubahan disimpan.", [{ text: "OK", onPress: () => router.back() }]);
     } catch (e: any) {
+      console.warn("saveAll error:", e);
       Alert.alert("Gagal", e?.message || "Tidak bisa menyimpan perubahan.");
     } finally {
       setSaving(false);
@@ -254,8 +335,9 @@ export default function PortfolioEdit() {
               {serverPhotos.map((p, idx) => (
                 <View key={`${p}-${idx}`}>
                   <Image
-                    source={{ uri: toFullUrl(p) }}
+                    source={{ uri: isHttp(p) ? toFullUrl(p) : p }}
                     style={{ width: "100%", height: 180, borderRadius: 10, backgroundColor: "#f3f4f6" }}
+                    resizeMode="cover"
                   />
                   <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 6 }}>
                     <TouchableOpacity
