@@ -1,3 +1,4 @@
+// app/(mua)/settings.tsx  (atau path yang sesuai)
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View, Text, StyleSheet, TextInput, TouchableOpacity, ActivityIndicator,
@@ -7,6 +8,9 @@ import { Ionicons } from "@expo/vector-icons";
 import * as SecureStore from "expo-secure-store";
 import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
+
+// optional helper in your project (if exists). If not present, ignore.
+import { getAuthToken } from "../../../utils/authStorage";
 
 type Me = {
   id?: string;
@@ -30,14 +34,49 @@ const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const MUTED = "#6B7280";
 
-// kompat expo-image-picker (baru/lama)
+// compatible expo-image-picker shapes
 const PickerMediaType: any =
   (ImagePicker as any).MediaType ?? (ImagePicker as any).MediaTypeOptions;
+
+/** Helper: parse JSON safely and throw nice errors; also return parsed object */
+async function fetchJsonChecked(url: string, opts: RequestInit = {}) {
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+
+  // If server returned non-JSON (HTML error page), throw snippet
+  if (!ct.includes("application/json")) {
+    const snippet = text ? text.slice(0, 800) : "";
+    const err: any = new Error(`Response bukan JSON: ${snippet}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    const err: any = new Error("Gagal parse JSON dari server.");
+    err.status = res.status;
+    throw err;
+  }
+
+  if (!res.ok) {
+    const msg = json?.message || json?.error || `HTTP ${res.status}`;
+    const err: any = new Error(msg);
+    err.status = res.status;
+    err.payload = json;
+    throw err;
+  }
+
+  return json;
+}
 
 export default function SettingsScreen() {
   const router = useRouter();
 
   const [token, setToken] = useState<string | null>(null);
+  const [tokenReady, setTokenReady] = useState(false);
 
   // form
   const [name, setName] = useState("");
@@ -56,10 +95,8 @@ export default function SettingsScreen() {
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
-  const authHeaders = useMemo(
-    () => (token ? { Authorization: `Bearer ${token}` } : undefined),
-    [token]
-  );
+  // authHeaders memo
+  const authHeaders = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
   function guessMimeFromUri(uri: string) {
     const lower = uri.split("?")[0].toLowerCase();
@@ -79,43 +116,78 @@ export default function SettingsScreen() {
     return `${name}.${ext}`;
   }
 
-  // STEP 1: token
+  // STEP 1: bootstrap token (try getAuthToken(), fallback SecureStore)
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
+        let t: string | null = null;
+        if (typeof getAuthToken === "function") {
+          try { t = await getAuthToken(); } catch (e) { /* ignore */ }
         }
-      } catch {}
+        if (!t) {
+          const raw = await SecureStore.getItemAsync("auth");
+          if (raw) {
+            try {
+              const auth = JSON.parse(raw);
+              t = auth?.token ?? auth?.accessToken ?? auth?.access_token ?? null;
+            } catch {}
+          }
+        }
+        if (t) setToken(String(t));
+      } catch (e) {
+        console.warn("bootstrap token failed", e);
+      } finally {
+        setTokenReady(true);
+      }
     })();
   }, []);
 
-  // STEP 2: load profil
+  // STEP 2: load profile (wait until tokenReady)
   useEffect(() => {
-    if (!token) { setLoading(false); return; }
+    if (!tokenReady) return;
+
+    // If no token, treat as unauthenticated — show empty form and stop loading
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+
     const ctrl = new AbortController();
     (async () => {
+      setLoading(true);
       try {
-        const res = await fetch(API_ME, { headers: authHeaders, signal: ctrl.signal });
-        if (!res.ok) throw new Error("Gagal memuat profil");
-        const me: Me = await res.json();
+        const json = await fetchJsonChecked(API_ME, { headers: { Accept: "application/json", ...(authHeaders || {}) }, signal: ctrl.signal });
+        // api may return { data: { ... } } or the object directly
+        const payload = json?.data ?? json;
+        const me: Me = payload;
+
         if (!mounted.current) return;
 
-        setName(me?.profile?.name || me?.name || "");
-        setPhone(me?.profile?.phone || "");
-        setAddress(me?.profile?.address || "");
-        setBio(me?.profile?.bio || "");
+        setName(me?.profile?.name ?? me?.name ?? "");
+        setPhone(me?.profile?.phone ?? "");
+        setAddress(me?.profile?.address ?? "");
+        setBio(me?.profile?.bio ?? "");
         const url = me?.profile?.photo_url ?? "";
         setServerPhotoUrl(url && url !== "null" && url !== "undefined" ? url : "");
-      } catch {
+      } catch (e: any) {
+        // handle unauthorized separately
+        if (e?.status === 401) {
+          // clear auth and force login
+          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          Alert.alert("Sesi berakhir", "Silakan login kembali.", [
+            { text: "OK", onPress: () => router.replace("/(auth)/login") },
+          ]);
+          return;
+        }
+        console.warn("Load profile failed:", e?.message ?? e);
+        Alert.alert("Gagal memuat profil", e?.message || "Periksa koneksi atau coba lagi.");
       } finally {
         mounted.current && setLoading(false);
       }
     })();
+
     return () => ctrl.abort();
-  }, [token, authHeaders]);
+  }, [tokenReady, token, authHeaders, router]);
 
   // PILIH FOTO
   async function onPickPhoto() {
@@ -130,33 +202,39 @@ export default function SettingsScreen() {
         allowsEditing: true,
         quality: 0.9,
       });
-      if (res.canceled) return;
+      // new API: res.canceled true => didn't pick. older returns res.uri directly
+      if ((res as any).canceled) return;
+      const asset = (res as any).assets ? (res as any).assets[0] : (res as any);
+      if (!asset?.uri) return;
 
-      const a = res.assets?.[0];
-      if (!a?.uri) return;
-
-      const mime = (a as any).mimeType || guessMimeFromUri(a.uri);
-      const base = (a as any).fileName || (a.uri.split("/").pop() ?? `photo_${Date.now()}`);
+      const mime = (asset as any).mime || guessMimeFromUri(asset.uri);
+      const base = (asset as any).fileName || (asset.uri.split("/").pop() ?? `photo_${Date.now()}`);
       const name = ensureExtMatches(base, mime);
-      const uri = a.uri.startsWith("file://") ? a.uri : `file://${a.uri}`;
+      const uri = asset.uri.startsWith("file://") ? asset.uri : `file://${asset.uri}`;
 
       setPhotoAsset({ uri, name, type: mime });
     } catch (e: any) {
+      console.warn("onPickPhoto error:", e);
       Alert.alert("Gagal", e?.message || "Tidak bisa membuka galeri");
     }
   }
 
-  // SIMPAN (selalu multipart + _method=PATCH; aman walau tanpa foto)
+  // SIMPAN (multipart + _method=PATCH)
   async function onSave() {
     try {
+      if (!token) {
+        Alert.alert("Butuh Login", "Silakan login untuk memperbarui profil.");
+        return;
+      }
+
       setSaving(true);
 
       const fd = new FormData();
       fd.append("_method", "PATCH");
-      if (name)    fd.append("name", name);
-      if (phone)   fd.append("phone", phone);
+      if (name) fd.append("name", name);
+      if (phone) fd.append("phone", phone);
       if (address) fd.append("address", address);
-      if (bio)     fd.append("bio", bio);
+      if (bio) fd.append("bio", bio);
 
       if (photoAsset) {
         fd.append("photo_url", {
@@ -170,15 +248,25 @@ export default function SettingsScreen() {
         method: "POST",
         headers: {
           Accept: "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          // penting: JANGAN set Content-Type
+          Authorization: `Bearer ${token}`,
+          // DON'T set Content-Type — let fetch set multipart boundary
         },
-        body: fd,
+        body: fd as any,
       });
 
-      const json = await res.json().catch(() => ({}));
+      // parse safely
+      const text = await res.text();
+      const ct = res.headers.get("content-type") || "";
+      let json: any = {};
+      try { json = ct.includes("application/json") ? JSON.parse(text) : {}; } catch { json = {}; }
+
       if (!res.ok) {
-        console.warn("PROFILE SAVE FAILED", res.status, json);
+        // handle 401
+        if (res.status === 401) {
+          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          Alert.alert("Sesi berakhir", "Silakan login kembali.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+          return;
+        }
         const firstErr =
           (json?.errors && (Object.values(json.errors)[0] as any)?.[0]) ||
           json?.message ||
@@ -186,13 +274,13 @@ export default function SettingsScreen() {
         throw new Error(firstErr);
       }
 
-      const newUrl = json?.profile?.photo_url || json?.photo_url;
+      // success: update UI & local cache
+      const newUrl = json?.profile?.photo_url ?? json?.photo_url;
       if (newUrl) {
         setServerPhotoUrl(newUrl);
         setPhotoAsset(null);
       }
 
-      // update cache nama lokal
       try {
         const raw = await SecureStore.getItemAsync("auth");
         if (raw) {
@@ -201,10 +289,13 @@ export default function SettingsScreen() {
           if (auth?.profile) auth.profile.name = name;
           await SecureStore.setItemAsync("auth", JSON.stringify(auth));
         }
-      } catch {}
+      } catch (e) {
+        console.warn("update auth cache failed", e);
+      }
 
       Alert.alert("Sukses", "Profil berhasil diperbarui.");
     } catch (e: any) {
+      console.warn("Save profile failed:", e);
       Alert.alert("Gagal", e?.message || "Tidak bisa menyimpan profil.");
     } finally {
       setSaving(false);
@@ -214,12 +305,14 @@ export default function SettingsScreen() {
   async function onLogout() {
     try {
       setLoggingOut(true);
-      await fetch(`${API_LOGOUT}?all=true`, {
-        method: "POST",
-        headers: { Accept: "application/json", ...(authHeaders || {}) },
-      }).catch(() => {});
-      await SecureStore.deleteItemAsync("auth");
-      Alert.alert("Keluar", "Anda telah keluar.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+      try {
+        await fetch(`${API_LOGOUT}?all=true`, {
+          method: "POST",
+          headers: { Accept: "application/json", ...(authHeaders || {}) },
+        });
+      } catch {}
+      await SecureStore.deleteItemAsync("auth").catch(() => {});
+      router.replace("/(auth)/login");
     } finally {
       setLoggingOut(false);
     }
@@ -228,7 +321,8 @@ export default function SettingsScreen() {
   if (loading) {
     return (
       <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <ActivityIndicator />
+        <ActivityIndicator color={PURPLE} />
+        <Text style={{ color: MUTED, marginTop: 8 }}>Memuat profil…</Text>
       </View>
     );
   }
