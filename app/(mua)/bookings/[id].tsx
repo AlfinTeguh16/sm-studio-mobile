@@ -16,11 +16,10 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import * as SecureStore from "expo-secure-store";
 import * as Clipboard from "expo-clipboard";
 
-
-
+// NOTE: sesuaikan path relatif jika utils berada di lokasi lain
+import authStorage from "../../../utils/authStorage";
 
 /* ================== Types ================== */
 type Booking = {
@@ -102,24 +101,17 @@ function fmtDate(idt?: string | null) {
 
 type HeaderMap = Record<string, string>;
 
-
-async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
-  }
-}
-
-
 async function getAuthHeaders(): Promise<HeaderMap> {
-  const token = await getAuthToken();
-  const h: HeaderMap = { Accept: "application/json" };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
+  try {
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { Accept: "application/json" };
+    if (token) h.Authorization = `Bearer ${token}`;
+    else console.debug("[booking] no auth token available");
+    return h;
+  } catch (e) {
+    console.warn("getAuthHeaders failed", e);
+    return { Accept: "application/json" };
+  }
 }
 
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
@@ -196,7 +188,8 @@ export default function BookingInvoiceScreen() {
       } catch (e: any) {
         if (e?.message === "401_UNAUTH") {
           Alert.alert("Sesi berakhir", "Silakan login kembali.");
-          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          // gunakan util clearAuthAll agar semua key yang mungkin disimpan dihapus
+          await authStorage.clearAuthAll().catch(() => {});
           router.replace("/(auth)/login");
         } else {
           Alert.alert("Oops", e?.message || "Tidak bisa memuat invoice");
@@ -220,7 +213,13 @@ export default function BookingInvoiceScreen() {
         const list: MuaLoc[] = (mJson as any)?.data ?? (mJson as MuaLoc[]) ?? [];
         setMuaList(list);
       } catch (e: any) {
-        Alert.alert("Gagal", e?.message || "Tidak bisa memuat daftar MUA.");
+        if (e?.message === "401_UNAUTH") {
+          Alert.alert("Sesi berakhir", "Silakan login kembali.");
+          await authStorage.clearAuthAll().catch(() => {});
+          router.replace("/(auth)/login");
+        } else {
+          Alert.alert("Gagal", e?.message || "Tidak bisa memuat daftar MUA.");
+        }
       } finally {
         setMuaLoading(false);
       }
@@ -270,7 +269,13 @@ export default function BookingInvoiceScreen() {
       setBooking(updated);
       Alert.alert("Berhasil", "Status booking ditandai selesai.");
     } catch (e: any) {
-      Alert.alert("Gagal", e?.message || "Tidak bisa mengubah status.");
+      if (e?.message === "401_UNAUTH") {
+        Alert.alert("Sesi berakhir", "Silakan login kembali.");
+        await authStorage.clearAuthAll().catch(() => {});
+        router.replace("/(auth)/login");
+      } else {
+        Alert.alert("Gagal", e?.message || "Tidak bisa mengubah status.");
+      }
     } finally {
       setUpdating(false);
     }
@@ -353,7 +358,7 @@ export default function BookingInvoiceScreen() {
             } catch (e: any) {
               if (e?.message === "401_UNAUTH") {
                 Alert.alert("Sesi berakhir", "Silakan login kembali.");
-                await SecureStore.deleteItemAsync("auth").catch(() => {});
+                await authStorage.clearAuthAll().catch(() => {});
                 router.replace("/(auth)/login");
               } else {
                 Alert.alert("Gagal", e?.message || "Tidak dapat mengirim undangan.");
@@ -554,7 +559,7 @@ export default function BookingInvoiceScreen() {
             ) : (
               <FlatList
                 data={filteredMuaList()}
-                keyExtractor={(item) => item.id}
+                keyExtractor={(item) => String(item.id)}
                 renderItem={({ item }) => {
                   const checked = selectedIds.includes(item.id);
                   // skip if this is lead mua (can't invite lead to itself)
