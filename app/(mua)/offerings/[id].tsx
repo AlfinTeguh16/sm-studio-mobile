@@ -8,6 +8,8 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
+// CHANGED: gunakan authStorage helper (sesuaikan path jika perlu)
+import authStorage from "../../../utils/authStorage";
 
 const API = "https://smstudio.my.id/api";
 const BASE = API.replace(/\/api$/,""); // untuk prefix /storage/...
@@ -75,16 +77,52 @@ export default function MuaOfferingDetail() {
   const pictures = useMemo(() => (picturesRaw || []).map(absolutize).filter(Boolean), [picturesRaw]);
   const [slide, setSlide] = useState(0);
 
+  // Robust token load: try authStorage, then fallback to legacy SecureStore 'auth' object
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
+        // 1) primary: authStorage.getAuthToken()
+        const t1 = await authStorage.getAuthToken().catch(() => null);
+        if (t1) {
+          console.log("[OfferingDetail] token from authStorage");
+          setToken(t1);
+          setTokenReady(true);
+          return;
         }
-      } catch {}
-      setTokenReady(true);
+
+        // 2) fallback: legacy "auth" object in SecureStore
+        try {
+          const raw = await SecureStore.getItemAsync("auth");
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              const candidate = parsed?.token ?? parsed?.access_token ?? parsed?.data?.token ?? null;
+              if (candidate) {
+                console.log("[OfferingDetail] token from SecureStore 'auth' object");
+                setToken(candidate);
+                setTokenReady(true);
+                return;
+              } else {
+                console.warn("[OfferingDetail] SecureStore auth found but no token property");
+              }
+            } catch (err) {
+              console.warn("[OfferingDetail] failed parse SecureStore auth", err);
+            }
+          } else {
+            console.warn("[OfferingDetail] SecureStore 'auth' empty");
+          }
+        } catch (err) {
+          console.warn("[OfferingDetail] error reading SecureStore 'auth'", err);
+        }
+
+        // 3) nothing found — still mark tokenReady so fetchDetail won't hang forever
+        console.warn("[OfferingDetail] no token found (authStorage + SecureStore empty)");
+        setToken(null);
+        setTokenReady(true);
+      } catch (err) {
+        console.warn("[OfferingDetail] token load error:", err);
+        setTokenReady(true);
+      }
     })();
   }, []);
 
@@ -94,6 +132,11 @@ export default function MuaOfferingDetail() {
       setLoading(false);
       return;
     }
+
+    // If token not ready yet, wait
+    if (!tokenReady) return;
+
+    // if no token after trying all fallbacks -> ask login (don't auto redirect before showing message)
     if (!token) {
       setLoading(false);
       Alert.alert("Perlu Login", "Silakan login untuk melihat detail offering.", [
@@ -112,7 +155,13 @@ export default function MuaOfferingDetail() {
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
         console.warn("GET /offerings/:id failed", res.status, txt);
-        if (res.status === 401) throw new Error("Sesi berakhir atau belum login.");
+        if (res.status === 401) {
+          // clear auth to avoid loop, then navigate to login
+          try {
+            await authStorage.clearAuthAll().catch(()=>{});
+          } catch {}
+          throw new Error("Sesi berakhir atau belum login.");
+        }
         throw new Error(`Gagal memuat (status ${res.status})`);
       }
 
@@ -126,17 +175,18 @@ export default function MuaOfferingDetail() {
       setSlide(0);
     } catch (e: any) {
       setItem(null);
+      const isSession = (e?.message || "").toLowerCase().includes("sesi berakhir") || (e?.message || "").toLowerCase().includes("401");
       Alert.alert(
         "Gagal",
         e?.message || "Tidak bisa memuat detail",
-        e?.message?.includes("Sesi berakhir")
+        isSession
           ? [{ text: "Login", onPress: () => router.push("/(auth)/login") }, { text: "Tutup" }]
           : [{ text: "Tutup" }]
       );
     } finally {
       setLoading(false);
     }
-  }, [id, token, router]);
+  }, [id, token, tokenReady, router]);
 
   useEffect(() => {
     if (!tokenReady) return;
@@ -216,7 +266,7 @@ export default function MuaOfferingDetail() {
         <View style={{ flexDirection: "row", gap: 8 }}>
           <TouchableOpacity
             style={styles.iconBtn}
-            onPress={() => router.push({ pathname: "/offerings/[id]/edit", params: { id: String(item.id) } })}
+            onPress={() => router.push({ pathname: "/(mua)/offerings/[id]/edit", params: { id: String(item.id) } })}
           >
             <Ionicons name="create-outline" size={18} color={TEXT} />
           </TouchableOpacity>
@@ -351,7 +401,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
   },
 
-  /* hero & slider */
   hero: { height: 260, backgroundColor: "#eee" },
   dotsWrap: {
     position: "absolute",
