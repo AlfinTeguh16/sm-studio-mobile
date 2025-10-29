@@ -11,13 +11,15 @@ import {
   Alert,
   RefreshControl,
   Platform,
-  NativeScrollEvent,
   NativeSyntheticEvent,
+  NativeScrollEvent,
   useWindowDimensions,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
+// gunakan getAuthToken kalau tersedia di project (fallback SecureStore)
+import { getAuthToken } from "../../../utils/authStorage";
 
 const API = "https://smstudio.my.id/api";
 const BASE = API.replace(/\/api$/, "");
@@ -29,8 +31,8 @@ const CARD_BG = "#F7F2FA";
 
 type Portfolio = {
   id: number | string;
-  mua_id: string;
-  name: string;
+  mua_id?: string;
+  name?: string;
   photos?: string[] | string | null;
   makeup_type?: string | null;
   collaboration?: string | null;
@@ -38,8 +40,9 @@ type Portfolio = {
   updated_at?: string | null;
 };
 
-function toFullUrl(u: string) {
-  return u?.startsWith("/storage/") ? `${BASE}${u}` : u;
+function toFullUrl(u?: string | null) {
+  if (!u) return "";
+  return u.startsWith("/storage/") ? `${BASE}${u}` : u;
 }
 function titleCase(s?: string | null) {
   return (s ?? "")
@@ -56,10 +59,10 @@ function toDateLabel(iso?: string | null) {
 }
 function normalizePhotos(p?: string[] | string | null): string[] {
   if (!p) return [];
-  if (Array.isArray(p)) return p.filter(Boolean);
+  if (Array.isArray(p)) return p.filter(Boolean).map(String);
   try {
-    const arr = JSON.parse(p);
-    if (Array.isArray(arr)) return arr.filter(Boolean);
+    const arr = JSON.parse(String(p));
+    if (Array.isArray(arr)) return arr.filter(Boolean).map(String);
   } catch {}
   return String(p)
     .split(",")
@@ -72,102 +75,149 @@ export default function PortfolioDetail() {
   const { id } = useLocalSearchParams<{ id?: string }>();
   const { width } = useWindowDimensions();
 
+  // ref ke ScrollView
+  const heroRef = useRef<ScrollView | null>(null);
+
   const [token, setToken] = useState<string | null>(null);
   const [tokenReady, setTokenReady] = useState(false);
   const [item, setItem] = useState<Portfolio | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-
-  // slider state
-  const heroRef = useRef<ScrollView>(null);
   const [index, setIndex] = useState(0);
 
+  // ambil token dari util getAuthToken() dulu, fallback SecureStore
   useEffect(() => {
     (async () => {
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
+        let t: string | null = null;
+        if (typeof getAuthToken === "function") {
+          try {
+            t = await getAuthToken();
+          } catch (e) {
+            // ignore
+          }
         }
-      } catch {}
-      setTokenReady(true);
+        if (!t) {
+          const raw = await SecureStore.getItemAsync("auth");
+          if (raw) {
+            try {
+              const auth = JSON.parse(raw);
+              t = auth?.token ?? auth?.accessToken ?? auth?.access_token ?? null;
+            } catch {}
+          }
+        }
+        if (t) setToken(String(t));
+      } catch (e) {
+        console.warn("bootstrap token failed:", e);
+      } finally {
+        setTokenReady(true); // penting: menandai selesai bootstrap, walau token null
+      }
     })();
   }, []);
 
-  const load = useCallback(async () => {
+  const fetchPortfolio = useCallback(async () => {
     if (!id) {
       setItem(null);
       setLoading(false);
-      Alert.alert("Oops", "ID tidak valid");
+      Alert.alert("Oops", "ID portofolio tidak valid.");
       return;
     }
 
     setLoading(true);
-    const url = `${API}/portfolios/${encodeURIComponent(id)}`;
+    const url = `${API}/portfolios/${encodeURIComponent(String(id))}`;
 
-    const req = async (useAuth: boolean) => {
-      const h: Record<string, string> = { Accept: "application/json" };
-      if (useAuth && token) h.Authorization = `Bearer ${token}`;
-      const res = await fetch(url, { headers: h, cache: "no-store" });
+    async function doReq(useAuth: boolean) {
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (useAuth && token) headers.Authorization = `Bearer ${token}`;
+
+      console.log("[PORTFOLIO] GET", url, "useAuth:", useAuth, "headers:", Object.keys(headers));
+      const res = await fetch(url, { headers, cache: "no-store" });
       const text = await res.text();
+      const ct = res.headers.get("content-type") || "";
+
       if (!res.ok) {
-        console.warn("GET /portfolios/:id fail", {
-          status: res.status,
-          ct: res.headers.get("content-type"),
-          body: text.slice(0, 200),
-        });
+        // 401 -> sesi bermasalah
+        if (res.status === 401) {
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch {}
+          const msg = parsed?.message ?? "Unauthenticated.";
+          const err: any = new Error(msg);
+          err.status = 401;
+          throw err;
+        }
+
+        console.warn("GET /portfolios/:id failed", { status: res.status, ct, body: text.slice(0, 400) });
         let msg: string | undefined;
-        try {
-          msg = JSON.parse(text)?.message;
-        } catch {}
+        try { msg = JSON.parse(text)?.message; } catch {}
         const err: any = new Error(msg || `HTTP ${res.status}`);
         err.status = res.status;
         throw err;
       }
+
+      if (!ct.includes("application/json")) {
+        const snippet = text ? text.slice(0, 400) : "";
+        const err: any = new Error(`Response bukan JSON: ${snippet}`);
+        err.status = res.status;
+        throw err;
+      }
+
       try {
         return JSON.parse(text);
       } catch {
-        throw new Error("Response bukan JSON");
+        const err: any = new Error("Gagal parse JSON.");
+        err.status = res.status;
+        throw err;
       }
-    };
+    }
 
     try {
+      // hanya panggil setelah tokenReady agar tidak terjadi request prematur
+      // caller memastikan tokenReady; tapi double-check
       let json: any;
       if (token) {
         try {
-          json = await req(true);
+          json = await doReq(true);
         } catch (e: any) {
           if (e?.status === 401) {
-            console.log("Token invalid? Fallback tanpa token…");
-            json = await req(false);
+            // token expired / invalid -> hapus auth dan redirect ke login
+            await SecureStore.deleteItemAsync("auth").catch(() => {});
+            Alert.alert("Sesi Berakhir", "Sesi Anda kadaluarsa. Silakan login kembali.", [
+              { text: "Login", onPress: () => router.replace("/(auth)/login") },
+            ]);
+            setItem(null);
+            setLoading(false);
+            return;
           } else {
-            throw e;
+            // coba fallback tanpa auth (resource publik)
+            json = await doReq(false);
           }
         }
       } else {
-        json = await req(false);
+        json = await doReq(false);
       }
 
       const data: Portfolio = json?.data ?? json;
       if (!data || typeof data !== "object" || typeof data.id === "undefined") {
-        throw new Error("Format data tidak sesuai");
+        throw new Error("Data portofolio tidak valid.");
       }
+
       setItem(data);
-      // reset slider
       setIndex(0);
       // scroll ke awal
-      requestAnimationFrame(() => {
-        heroRef.current?.scrollTo({ x: 0, animated: false });
-      });
+      setTimeout(() => {
+        try {
+          heroRef.current?.scrollTo?.({ x: 0, animated: false });
+        } catch {}
+      }, 0);
     } catch (e: any) {
       if (e?.status === 401) {
-        Alert.alert("Oops", "Sesi berakhir. Silakan login kembali.", [
+        // di-handle di atas, fallback juga
+        Alert.alert("Sesi berakhir", "Silakan login kembali.", [
           { text: "Login", onPress: () => router.replace("/(auth)/login") },
-          { text: "Tutup" },
         ]);
       } else {
-        Alert.alert("Oops", e?.message || "Gagal memuat portofolio");
+        Alert.alert("Gagal", e?.message || "Tidak bisa memuat portofolio.");
+        console.warn("fetchPortfolio error:", e);
       }
       setItem(null);
     } finally {
@@ -175,31 +225,37 @@ export default function PortfolioDetail() {
     }
   }, [id, token, router]);
 
+  // panggil fetch hanya saat tokenReady (tidak prematur)
   useEffect(() => {
     if (!tokenReady) return;
-    load();
-  }, [tokenReady, load]);
+    fetchPortfolio();
+  }, [tokenReady, fetchPortfolio]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await load();
-    setRefreshing(false);
-  }, [load]);
+    try {
+      await fetchPortfolio();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchPortfolio]);
 
   const onMomentumEnd = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const x = e.nativeEvent.contentOffset.x;
-    const i = Math.round(x / width);
+    const i = Math.round(x / Math.max(1, width));
     if (i !== index) setIndex(i);
   };
 
   const jumpTo = (i: number) => {
     setIndex(i);
-    heroRef.current?.scrollTo({ x: i * width, animated: true });
+    try {
+      heroRef.current?.scrollTo?.({ x: i * Math.max(1, width), animated: true });
+    } catch {}
   };
 
   if (loading) {
     return (
-      <View style={[styles.center]}>
+      <View style={styles.center}>
         <ActivityIndicator color={PURPLE} />
         <Text style={{ color: MUTED, marginTop: 6 }}>Memuat…</Text>
       </View>
@@ -210,7 +266,7 @@ export default function PortfolioDetail() {
     return (
       <View style={styles.center}>
         <Text style={{ color: MUTED, marginBottom: 8 }}>Data tidak ditemukan.</Text>
-        <TouchableOpacity style={styles.primaryBtn} onPress={load}>
+        <TouchableOpacity style={styles.primaryBtn} onPress={fetchPortfolio}>
           <Ionicons name="refresh" size={16} color="#fff" />
           <Text style={{ color: "#fff", fontWeight: "800", marginLeft: 6 }}>Muat Ulang</Text>
         </TouchableOpacity>
@@ -218,7 +274,7 @@ export default function PortfolioDetail() {
     );
   }
 
-  const pics = normalizePhotos(item.photos).map(toFullUrl);
+  const pics = normalizePhotos(item.photos).map(toFullUrl).filter(Boolean);
   const hasMultiple = pics.length > 1;
 
   return (
@@ -228,12 +284,16 @@ export default function PortfolioDetail() {
         <TouchableOpacity style={styles.iconBtn} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={18} color={TEXT} />
         </TouchableOpacity>
+
         <Text style={styles.headerTitle} numberOfLines={1}>
           {item.name || "Portofolio"}
         </Text>
+
         <TouchableOpacity
           style={styles.iconBtn}
-          onPress={() => router.push({ pathname: "/(mua)/portfolio/[id]/edit", params: { id: String(item.id) } })}
+          onPress={() =>
+            router.push({ pathname: "/(mua)/portfolio/[id]/edit", params: { id: String(item.id) } })
+          }
         >
           <Ionicons name="create-outline" size={18} color={TEXT} />
         </TouchableOpacity>
@@ -243,24 +303,30 @@ export default function PortfolioDetail() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         contentContainerStyle={{ paddingBottom: 24 }}
       >
-        {/* HERO SLIDER */}
+        {/* HERO */}
         {pics.length ? (
           <View>
             <ScrollView
-              ref={heroRef}
+              // ref sebagai callback yang mengembalikan void (tidak mengembalikan nilai)
+              ref={(r) => {
+                heroRef.current = r;
+              }}
               horizontal
               pagingEnabled
               showsHorizontalScrollIndicator={false}
               onMomentumScrollEnd={onMomentumEnd}
-              contentContainerStyle={{}}
               style={{ width }}
             >
               {pics.map((p, i) => (
-                <Image key={i} source={{ uri: p }} style={{ width, height: 260, backgroundColor: "#eee" }} />
+                <Image
+                  key={`${p}-${i}`}
+                  source={{ uri: p }}
+                  style={{ width: Math.max(1, width), height: 260, backgroundColor: "#eee" }}
+                  resizeMode="cover"
+                />
               ))}
             </ScrollView>
 
-            {/* Dots indicator */}
             {hasMultiple && (
               <View style={styles.dotsWrap} pointerEvents="none">
                 {pics.map((_, i) => (
@@ -273,6 +339,7 @@ export default function PortfolioDetail() {
           <Image
             source={{ uri: "https://via.placeholder.com/1200x800.png?text=Portfolio" }}
             style={{ width: "100%", height: 260, backgroundColor: "#eee" }}
+            resizeMode="cover"
           />
         )}
 
@@ -284,7 +351,7 @@ export default function PortfolioDetail() {
             contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 8 }}
           >
             {pics.map((p, i) => (
-              <TouchableOpacity key={i} onPress={() => jumpTo(i)} activeOpacity={0.9}>
+              <TouchableOpacity key={`${p}-${i}`} onPress={() => jumpTo(i)} activeOpacity={0.9}>
                 <Image
                   source={{ uri: p }}
                   style={[
@@ -297,7 +364,7 @@ export default function PortfolioDetail() {
           </ScrollView>
         )}
 
-        {/* Body */}
+        {/* BODY */}
         <View style={{ paddingHorizontal: 16, paddingTop: 14 }}>
           <Text style={styles.title}>{item.name}</Text>
 
@@ -390,6 +457,7 @@ const styles = StyleSheet.create({
     height: 7,
     borderRadius: 7 / 2,
     backgroundColor: "rgba(255,255,255,0.5)",
+    marginHorizontal: 4,
   },
   dotActive: {
     backgroundColor: "#fff",

@@ -1,106 +1,198 @@
-import React, { useCallback, useEffect, useState } from "react";
+// app/(mua)/notifications/index.tsx
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator,
-  RefreshControl, Alert, Platform
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+  RefreshControl,
+  Alert,
+  Platform,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { api } from "../../../lib/api";
+import { getAuthToken } from "../../../utils/authStorage"; // pastikan ada
+// jika belum ada, buat helper sederhana (lihat catatan di bawah)
 
-/** Extract booking id from notification message */
+/* ---------------- types ---------------- */
+type Notif = {
+  id: string | number;
+  user_id?: string | number;
+  title?: string | null;
+  message?: string | null;
+  type?: string | null;
+  is_read?: boolean | null;
+  created_at?: string | null;
+  [k: string]: any;
+};
 
+/* ---------------- constants ---------------- */
+const API_BASE = "https://smstudio.my.id/api";
 const PURPLE = "#AA60C8";
 const BORDER = "#E5E7EB";
 const MUTED = "#6B7280";
 const TEXT = "#111827";
 const CARD_BG = "#F7F2FA";
 
-type Notif = {
-  id: string | number;
-  user_id: string;
-  title: string;
-  message: string;
-  type: string; // can be 'booking_invite', 'booking', 'system', 'payment', etc.
-  is_read: boolean;
-  created_at?: string;
-};
-
-const fmtTime = (iso?: string) => {
+/* ---------------- helpers ---------------- */
+const fmtTime = (iso?: string | null) => {
   if (!iso) return "-";
   const d = new Date(iso);
   if (!Number.isFinite(+d)) return iso;
-  return d.toLocaleString("id-ID", { day: "2-digit", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString("id-ID", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 };
 
-function extractBookingIdFromMessage(message?: string): string | null {
-  if (!message) return null;
-  const m1 = message.match(/#\s*(\d+)/);
-  if (m1 && m1[1]) return m1[1];
-  const m2 = message.match(/INV[-\s]*([0-9]+)/i);
-  if (m2 && m2[1]) return m2[1];
-  const allNums = message.match(/(\d{2,})/g);
+function extractBookingIdFromMessage(message?: string | null): string | null {
+  const m = String(message ?? "");
+  // #123
+  const mHash = m.match(/#\s*(\d+)/);
+  if (mHash && mHash[1]) return mHash[1];
+  // INV-123
+  const mInv = m.match(/INV[-\s]*([0-9]+)/i);
+  if (mInv && mInv[1]) return mInv[1];
+  // UUID-ish
+  const mUuid = m.match(/([0-9a-fA-F]{8}-[0-9a-fA-F-]{4,36})/);
+  if (mUuid && mUuid[1]) return mUuid[1];
+  // fallback: largest numeric group
+  const allNums = m.match(/(\d{2,})/g);
   if (allNums && allNums.length) return allNums[allNums.length - 1];
   return null;
 }
 
+/** safe fetch JSON helper — surfaces non-JSON responses with snippet */
+async function fetchJSON(url: string, options: RequestInit = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text();
+
+  if (!ct.includes("application/json")) {
+    const preview = (text || "").slice(0, 400).replace(/\s+/g, " ");
+    const err: any = new Error(`Expected JSON but got ${res.status} ${res.statusText}: ${preview}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    const err: any = new Error("Invalid JSON response");
+    err.status = res.status;
+    throw err;
+  }
+
+  if (!res.ok) {
+    const msg = json?.message || json?.error || `${res.status} ${res.statusText}`;
+    const err: any = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+
+  return json;
+}
+
+/* ---------------- component ---------------- */
 export default function NotificationsScreen() {
   const router = useRouter();
 
   const [items, setItems] = useState<Notif[]>([]);
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState<number>(1);
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [unreadCount, setUnreadCount] = useState<number>(0);
 
-  // --- safer fetchUnread: handle non-JSON errors (like HTML 404) and fallback to 0 ---
-  const fetchUnread = useCallback(async () => {
+  const unreadEndpoints = [
+    `${API_BASE}/notifications/unread-count`,
+    `${API_BASE}/notifications/unread_count`,
+    `${API_BASE}/notifications/count`,
+    `${API_BASE}/notifications/unread`,
+  ];
+
+  const fetchUnreadCount = useCallback(async () => {
     try {
-      const response = await api.notifications.getUnreadCount();
-      // support multiple shapes: { count } or { data: { count } }
-      const count = Number(response?.count ?? response?.data?.count ?? 0);
-      setUnreadCount(Number.isFinite(count) ? count : 0);
-    } catch (err: any) {
-      // server returned HTML or 404 — don't crash, fallback to 0 and log
-      console.warn("Error fetching unread count:", err);
+      const token = await getAuthToken();
+      if (!token) {
+        setUnreadCount(0);
+        return;
+      }
+      let ok = false;
+      for (const url of unreadEndpoints) {
+        try {
+          const json = await fetchJSON(url, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          const candidate = json?.count ?? json?.data?.count ?? json?.unread ?? json;
+          const n = typeof candidate === "number" ? candidate : Number(candidate ?? 0);
+          setUnreadCount(Number.isFinite(n) ? n : 0);
+          ok = true;
+          break;
+        } catch (err) {
+          // try next
+        }
+      }
+      if (!ok) setUnreadCount(0);
+    } catch (e) {
+      console.warn("fetchUnreadCount failed:", e);
       setUnreadCount(0);
     }
   }, []);
 
-  // --- safer fetchPage: always return { list, lastPage } even on error ---
   const fetchPage = useCallback(async (p = 1) => {
     try {
-      const response = await api.notifications.list({ per_page: 20, page: p });
-      const list = Array.isArray(response?.data) ? response.data : (Array.isArray(response) ? response : []);
-      const lastPage = Number(response?.last_page ?? (Array.isArray(list) ? (list.length < 20 ? 1 : p) : p)) || p;
-      return { list, lastPage };
-    } catch (err: any) {
-      console.warn(`notifications.list failed (page ${p}):`, err?.message ?? err);
-      // return safe defaults so UI continues to work
-      return { list: [], lastPage: p };
+      const token = await getAuthToken();
+      const url = `${API_BASE}/notifications?per_page=20&page=${p}`;
+      const json = await fetchJSON(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+      const list = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
+      const lastPage = Number(json?.last_page ?? 1) || 1;
+      return { list: list as Notif[], lastPage };
+    } catch (err) {
+      console.warn("fetchPage notifications failed:", err);
+      return { list: [] as Notif[], lastPage: 1 };
     }
   }, []);
 
-  // initial load
   useEffect(() => {
+    let alive = true;
     (async () => {
+      setLoading(true);
       try {
-        setLoading(true);
         const { list, lastPage } = await fetchPage(1);
+        if (!alive) return;
         setItems(list);
         setPage(1);
         setHasMore(1 < lastPage);
-        await fetchUnread();
+        await fetchUnreadCount();
       } catch (e: any) {
-        Alert.alert("Oops", e?.message || "Gagal memuat notifikasi");
+        Alert.alert("Gagal", e?.message || "Tidak bisa memuat notifikasi");
         setItems([]);
         setHasMore(false);
       } finally {
-        setLoading(false);
+        if (alive) setLoading(false);
       }
     })();
-  }, [fetchPage, fetchUnread]);
+    return () => {
+      alive = false;
+    };
+  }, [fetchPage, fetchUnreadCount]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -109,13 +201,13 @@ export default function NotificationsScreen() {
       setItems(list);
       setPage(1);
       setHasMore(1 < lastPage);
-      await fetchUnread();
-    } catch (error) {
-      console.error('Error refreshing notifications:', error);
+      await fetchUnreadCount();
+    } catch (err) {
+      console.warn("refresh failed:", err);
     } finally {
       setRefreshing(false);
     }
-  }, [fetchPage, fetchUnread]);
+  }, [fetchPage, fetchUnreadCount]);
 
   const loadMore = useCallback(async () => {
     if (loading || busy || !hasMore) return;
@@ -123,195 +215,276 @@ export default function NotificationsScreen() {
     try {
       const next = page + 1;
       const { list, lastPage } = await fetchPage(next);
-      setItems(prev => [...prev, ...list]);
+      setItems((prev) => [...prev, ...list]);
       setPage(next);
       setHasMore(next < lastPage);
-    } catch (error) {
-      console.error('Error loading more notifications:', error);
+    } catch (err) {
+      console.warn("loadMore failed:", err);
     } finally {
       setBusy(false);
     }
   }, [page, fetchPage, hasMore, loading, busy]);
 
-  // actions
-  const markRead = useCallback(async (id: string | number, read = true) => {
-    try {
-      await api.notifications.markAsRead(id);
-      setItems(prev => prev.map(n => n.id === id ? { ...n, is_read: read } : n));
-      fetchUnread();
-    } catch (error) {
-      console.error('Error marking notification as read:', error);
-      // optionally show toast/alert
-    }
-  }, [fetchUnread]);
+  const markRead = useCallback(
+    async (id: string | number, read = true) => {
+      try {
+        const token = await getAuthToken();
+        if (!token) throw new Error("Butuh login");
+        // endpoint backend bervariasi — coba POST /notifications/{id}/mark
+        await fetchJSON(`${API_BASE}/notifications/${encodeURIComponent(String(id))}/mark`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ is_read: read }),
+        });
+        setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: read } : n)));
+        await fetchUnreadCount();
+      } catch (err) {
+        console.warn("markRead failed:", err);
+        setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: read } : n)));
+      }
+    },
+    [fetchUnreadCount]
+  );
 
-  const deleteOne = useCallback(async (id: string | number) => {
-    try {
-      await api.notifications.delete(id);
-      setItems(prev => prev.filter(n => n.id !== id));
-      fetchUnread();
-    } catch (error) {
-      console.error('Error deleting notification:', error);
-    }
-  }, [fetchUnread]);
+  const deleteOne = useCallback(
+    async (id: string | number) => {
+      try {
+        const token = await getAuthToken();
+        if (!token) throw new Error("Butuh login");
+        await fetchJSON(`${API_BASE}/notifications/${encodeURIComponent(String(id))}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setItems((prev) => prev.filter((n) => n.id !== id));
+        await fetchUnreadCount();
+      } catch (err) {
+        console.warn("deleteOne failed:", err);
+        // Alert.alert("Gagal", err?.message || "Tidak bisa menghapus notifikasi.");
+      }
+    },
+    [fetchUnreadCount]
+  );
 
   const markAllRead = useCallback(async () => {
     try {
-      await api.notifications.markAllAsRead();
-      setItems(prev => prev.map(n => ({ ...n, is_read: true })));
-      fetchUnread();
-    } catch (error) {
-      console.error('Error marking all as read:', error);
+      const token = await getAuthToken();
+      if (!token) throw new Error("Butuh login");
+      await fetchJSON(`${API_BASE}/notifications/mark-all-read`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setItems((prev) => prev.map((n) => ({ ...n, is_read: true })));
+      await fetchUnreadCount();
+    } catch (err) {
+      console.warn("markAllRead failed:", err);
+      // Alert.alert("Gagal", err?.message || "Tidak bisa menandai semua sebagai dibaca.");
     }
-  }, [fetchUnread]);
+  }, [fetchUnreadCount]);
 
   const clearRead = useCallback(async () => {
     try {
-      await api.notifications.clearRead();
-      setItems(prev => prev.filter(n => !n.is_read));
-      fetchUnread();
-    } catch (error) {
-      console.error('Error clearing read notifications:', error);
+      const token = await getAuthToken();
+      if (!token) throw new Error("Butuh login");
+      await fetchJSON(`${API_BASE}/notifications/clear-read`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+      setItems((prev) => prev.filter((n) => !n.is_read));
+      await fetchUnreadCount();
+    } catch (err) {
+      console.warn("clearRead failed:", err);
+      // Alert.alert("Gagal", err?.message || "Tidak bisa membersihkan notifikasi dibaca.");
     }
-  }, [fetchUnread]);
+  }, [fetchUnreadCount]);
 
-  // respond invite
-  const respondInvite = useCallback(async (notif: Notif, action: "accept" | "decline") => {
-    const bookingId = extractBookingIdFromMessage(notif.message);
-    if (!bookingId) {
-      Alert.alert("Tidak dapat menanggapi", "Informasi booking tidak ditemukan pada notifikasi. Hubungi admin.");
-      return;
+
+
+async function respondInvite(notif: Notif, action: "accept" | "decline") {
+  const status = action === "accept" ? "accepted" : "declined";
+  const bookingId = extractBookingIdFromMessage(notif.message ?? null);
+
+  if (!bookingId) {
+    Alert.alert("Tidak dapat menanggapi", "ID booking tidak ditemukan pada notifikasi. Periksa pesan.");
+    return;
+  }
+
+  // ambil token & profile untuk diagnosa
+  const token = await getAuthToken();
+  if (!token) {
+    Alert.alert("Butuh login", "Silakan login terlebih dahulu.");
+    return;
+  }
+
+  try {
+    // optional: ambil /auth/me untuk memastikan profile id
+    const meRes = await fetch("https://smstudio.my.id/api/auth/me", {
+      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+    });
+    const meText = await meRes.text();
+    let meJson: any = null;
+    try { meJson = JSON.parse(meText); } catch {}
+    const me = (meJson && meJson.data) ? meJson.data : meJson ?? null;
+    console.log("[respondInvite] auth/me ->", me);
+
+    // kirim request ke endpoint respond (controller expects 'status')
+    const url = `https://smstudio.my.id/api/bookings/${encodeURIComponent(String(bookingId))}/collaborators/respond`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ status }),
+    });
+
+    const ct = res.headers.get("content-type") ?? "";
+    const text = await res.text();
+
+    // jika backend kirim HTML atau redirect -> tampilkan snippet
+    if (!ct.includes("application/json")) {
+      throw new Error(`Unexpected response (not JSON): ${text.slice(0, 400)}`);
     }
 
-    try {
-      setItems(prev => prev.map(i => i.id === notif.id ? { ...i, is_read: true } : i));
-      await api.bookings.respondToInvite(bookingId, action);
-      await markRead(notif.id, true);
-      setItems(prev => prev.filter(i => i.id !== notif.id));
-      fetchUnread();
-
-      Alert.alert(
-        action === "accept" ? "Terkonfirmasi" : "Ditolak",
-        action === "accept" ? "Anda telah menerima undangan." : "Anda menolak undangan."
-      );
-    } catch (e: any) {
-      console.warn("respondInvite error:", e);
-      Alert.alert("Gagal", e?.message || "Tidak dapat menanggapi undangan.");
-      setItems(prev => prev.map(i => i.id === notif.id ? { ...i, is_read: notif.is_read } : i));
+    const j = JSON.parse(text);
+    if (!res.ok) {
+      // tunjukkan pesan yang dikembalikan server (j.message) atau fallback
+      throw new Error(j?.message || j?.error || `HTTP ${res.status}`);
     }
-  }, [markRead, fetchUnread]);
 
-  // Invite card component
-  const InviteCard = useCallback(({ item }: { item: Notif }) => {
-    const bookingId = extractBookingIdFromMessage(item.message);
-    return (
-      <View style={[styles.cardInvite]}>
-        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-          <Text style={[styles.titleInvite]} numberOfLines={2}>{item.title || "Undangan Kolaborasi"}</Text>
-          <Text style={{ color: MUTED, fontSize: 12 }}>{fmtTime(item.created_at)}</Text>
-        </View>
+    // sukses
+    Alert.alert("Sukses", j?.message || "Tanggapan tersimpan.");
+    // update UI: hapus notifikasi / tandai dibaca
+    // (panggil fungsi markRead / fetchUnreadCount seperti sebelumnya)
+  } catch (err: any) {
+    console.warn("respondInvite error:", err);
+    // Detil error user-friendly
+    if (String(err.message || "").toLowerCase().includes("not found") ||
+        String(err.message || "").toLowerCase().includes("not invited")) {
+      Alert.alert("Gagal", "Undangan tidak ditemukan atau Anda bukan kolaborator untuk booking ini. Periksa bookingId / akun Anda.");
+    } else {
+      Alert.alert("Gagal", err?.message || String(err));
+    }
+  }
+}
 
-        <Text style={[styles.msgInvite, { marginTop: 8 }]}>{item.message}</Text>
 
-        {bookingId ? (
-          <Text style={[styles.metaInvite]}>Booking: <Text style={{ fontWeight: "800" }}>{bookingId}</Text></Text>
-        ) : (
-          <Text style={[styles.metaInvite]}>Booking: <Text style={{ fontStyle: "italic" }}>tidak diketahui</Text></Text>
-        )}
-
-        <View style={{ flexDirection: "row", marginTop: 12, gap: 8 }}>
-          <TouchableOpacity
-            style={[styles.btnAccept]}
-            onPress={() => {
-              Alert.alert(
-                "Konfirmasi",
-                "Terima undangan ini?",
-                [
-                  { text: "Batal", style: "cancel" },
-                  { text: "Terima", onPress: () => respondInvite(item, "accept") }
-                ]
-              );
-            }}
-          >
-            <Text style={{ color: "#fff", fontWeight: "800" }}>Terima</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.btnDecline]}
-            onPress={() => {
-              Alert.alert(
-                "Konfirmasi",
-                "Tolak undangan ini?",
-                [
-                  { text: "Batal", style: "cancel" },
-                  { text: "Tolak", onPress: () => respondInvite(item, "decline") }
-                ]
-              );
-            }}
-          >
-            <Text style={{ color: "#111827", fontWeight: "700" }}>Tolak</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.iconBtnSmall]}
-            onPress={() => markRead(item.id, !item.is_read)}
-          >
-            <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.iconBtnSmall, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]}
-            onPress={() => deleteOne(item.id)}
-          >
-            <Ionicons name="trash-outline" size={18} color="#DC2626" />
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }, [respondInvite, markRead, deleteOne]);
-
-  const renderItem = useCallback(({ item }: { item: Notif }) => {
-    const isInvite = item.type === "booking_invite" || /mengundang/i.test(item.message || "");
-    const color = item.type === "booking" ? "#0EA5E9" : item.type === "payment" ? "#10B981" : "#A78BFA";
-    if (isInvite) {
+  const InviteCard = useCallback(
+    ({ item }: { item: Notif }) => {
+      const bookingId = extractBookingIdFromMessage(item.message ?? null);
       return (
-        <View style={{ paddingHorizontal: 16 }}>
-          <InviteCard item={item} />
+        <View style={[styles.cardInvite]}>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text style={[styles.titleInvite]} numberOfLines={2}>
+              {item.title ?? "Undangan Kolaborasi"}
+            </Text>
+            <Text style={{ color: MUTED, fontSize: 12 }}>{fmtTime(item.created_at ?? null)}</Text>
+          </View>
+
+          <Text style={[styles.msgInvite, { marginTop: 8 }]}>{String(item.message ?? "")}</Text>
+
+          {bookingId ? (
+            <Text style={[styles.metaInvite]}>
+              Booking: <Text style={{ fontWeight: "800" }}>{bookingId}</Text>
+            </Text>
+          ) : (
+            <Text style={[styles.metaInvite]}>
+              Booking: <Text style={{ fontStyle: "italic" }}>tidak diketahui</Text>
+            </Text>
+          )}
+
+          <View style={{ flexDirection: "row", marginTop: 12, gap: 8 }}>
+            <TouchableOpacity
+              style={[styles.btnAccept]}
+              onPress={() =>
+                Alert.alert("Konfirmasi", "Terima undangan ini?", [
+                  { text: "Batal", style: "cancel" },
+                  { text: "Terima", onPress: () => respondInvite(item, "accept") },
+                ])
+              }
+            >
+              <Text style={{ color: "#fff", fontWeight: "800" }}>Terima</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.btnDecline]}
+              onPress={() =>
+                Alert.alert("Konfirmasi", "Tolak undangan ini?", [
+                  { text: "Batal", style: "cancel" },
+                  { text: "Tolak", onPress: () => respondInvite(item, "decline") },
+                ])
+              }
+            >
+              <Text style={{ color: "#111827", fontWeight: "700" }}>Tolak</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.iconBtnSmall]} onPress={() => markRead(item.id, !item.is_read)}>
+              <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.iconBtnSmall, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]} onPress={() => deleteOne(item.id)}>
+              <Ionicons name="trash-outline" size={18} color="#DC2626" />
+            </TouchableOpacity>
+          </View>
         </View>
       );
-    }
+    },
+    [respondInvite, markRead, deleteOne]
+  );
 
-    return (
-      <TouchableOpacity
-        onPress={() => router.push({ pathname: "/(mua)/notifications/[id]", params: { id: String(item.id) } })}
-        style={[styles.card, !item.is_read && { backgroundColor: "#F8FAFF", borderColor: "#DBEAFE" }]}
-        activeOpacity={0.9}
-      >
-        <View style={[styles.badgeType, { borderColor: color, backgroundColor: `${color}1A` }]}>
-          <Text style={{ color, fontWeight: "800", fontSize: 12 }}>{(item.type || "GEN").toUpperCase()}</Text>
-        </View>
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.title, !item.is_read && { color: TEXT }]} numberOfLines={2}>{item.title}</Text>
-          <Text style={styles.msg} numberOfLines={2}>{item.message}</Text>
-          <Text style={styles.time}>{fmtTime(item.created_at)}</Text>
-        </View>
+  const renderItem = useCallback(
+    ({ item }: { item: Notif }) => {
+      const m = String(item.message ?? "");
+      const isInvite = item.type === "booking_invite" || /mengundang/i.test(m);
+      const color = item.type === "booking" ? "#0EA5E9" : item.type === "payment" ? "#10B981" : "#A78BFA";
 
-        <View style={{ marginLeft: 10, alignItems: "flex-end", gap: 8 }}>
-          <TouchableOpacity onPress={() => markRead(item.id, !item.is_read)} style={styles.iconBtn}>
-            <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => deleteOne(item.id)} style={[styles.iconBtn, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]}>
-            <Ionicons name="trash-outline" size={18} color="#DC2626" />
-          </TouchableOpacity>
-        </View>
+      if (isInvite) {
+        return (
+          <View style={{ paddingHorizontal: 16 }}>
+            <InviteCard item={item} />
+          </View>
+        );
+      }
 
-        {!item.is_read && <View style={styles.unreadDot} />}
-      </TouchableOpacity>
-    );
-  }, [InviteCard, markRead, deleteOne, router]);
+      return (
+        <TouchableOpacity
+          onPress={() => router.push({ pathname: "/(mua)/notifications/[id]", params: { id: String(item.id ?? "") } })}
+          style={[styles.card, !item.is_read && { backgroundColor: "#F8FAFF", borderColor: "#DBEAFE" }]}
+          activeOpacity={0.9}
+        >
+          <View style={[styles.badgeType, { borderColor: color, backgroundColor: `${color}1A` }]}>
+            <Text style={{ color, fontWeight: "800", fontSize: 12 }}>{(item.type ?? "GEN").toUpperCase()}</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.title, !item.is_read && { color: TEXT }]} numberOfLines={2}>
+              {item.title}
+            </Text>
+            <Text style={styles.msg} numberOfLines={2}>
+              {String(item.message ?? "")}
+            </Text>
+            <Text style={styles.time}>{fmtTime(item.created_at ?? null)}</Text>
+          </View>
+
+          <View style={{ marginLeft: 10, alignItems: "flex-end", gap: 8 }}>
+            <TouchableOpacity onPress={() => markRead(item.id, !item.is_read)} style={styles.iconBtn}>
+              <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => deleteOne(item.id)} style={[styles.iconBtn, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]}>
+              <Ionicons name="trash-outline" size={18} color="#DC2626" />
+            </TouchableOpacity>
+          </View>
+
+          {!item.is_read && <View style={styles.unreadDot} />}
+        </TouchableOpacity>
+      );
+    },
+    [InviteCard, markRead, deleteOne, router]
+  );
 
   if (loading) {
-    return <View style={styles.center}><ActivityIndicator color={PURPLE} /><Text style={{ color: MUTED, marginTop: 6 }}>Memuat…</Text></View>;
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={PURPLE} />
+        <Text style={{ color: MUTED, marginTop: 6 }}>Memuat…</Text>
+      </View>
+    );
   }
 
   return (
@@ -337,7 +510,7 @@ export default function NotificationsScreen() {
         </View>
       </View>
 
-      <FlatList
+      <FlatList<Notif>
         data={items}
         keyExtractor={(it) => String(it.id)}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
@@ -353,6 +526,7 @@ export default function NotificationsScreen() {
   );
 }
 
+/* ---------------- styles ---------------- */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 8, android: 4 }) },
   center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" },
@@ -411,5 +585,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 8,
-  }
+  },
 });
