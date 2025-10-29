@@ -19,11 +19,9 @@ type Me = { id?: string; profile?: { id?: string } };
 type LocalImage = { uri: string; name: string; type: string };
 
 function uuidLike() {
-  // id sederhana untuk korelasi log (opsional)
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-/** Kompres ringan agar unggahan lebih kecil & kompatibel */
 async function compressToJpeg(uri: string): Promise<LocalImage> {
   const out = await ImageManipulator.manipulateAsync(
     uri,
@@ -31,6 +29,68 @@ async function compressToJpeg(uri: string): Promise<LocalImage> {
     { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
   );
   return { uri: out.uri, name: `photo_${Date.now()}.jpg`, type: "image/jpeg" };
+}
+
+/** Small helper: read token/profile robustly from SecureStore */
+async function bootstrapAuth(): Promise<{ token: string | null; profileId: string | null }> {
+  // try multiple keys / shapes
+  try {
+    // 1. try legacy "auth" key (object or plain)
+    const raw = await SecureStore.getItemAsync("auth").catch(() => null);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        const token = parsed?.token ?? parsed?.access_token ?? parsed?.accessToken ?? null;
+        const profileId = parsed?.profile?.id ?? parsed?.user?.id ?? parsed?.profile_id ?? null;
+        if (token || profileId) return { token: token ? String(token) : null, profileId: profileId ? String(profileId) : null };
+      } catch {
+        // raw might be plain token string
+        if (typeof raw === "string" && raw.length > 10) {
+          return { token: raw, profileId: null };
+        }
+      }
+    }
+
+    // 2. try separate token key
+    const t2 = await SecureStore.getItemAsync("auth_token").catch(() => null);
+    if (t2) return { token: t2, profileId: null };
+
+    const t3 = await SecureStore.getItemAsync("token").catch(() => null);
+    if (t3) return { token: t3, profileId: null };
+
+    // fallback none
+    return { token: null, profileId: null };
+  } catch {
+    return { token: null, profileId: null };
+  }
+}
+
+/** Fetch JSON helper that gives clearer error when response is not JSON (redirect/html) */
+async function fetchJsonOrThrow(url: string, opts: RequestInit = {}) {
+  const res = await fetch(url, { ...opts, headers: { Accept: "application/json", ...(opts.headers || {}) } });
+  const ct = res.headers.get("content-type") || "";
+  const text = await res.text();
+  if (!ct.includes("application/json")) {
+    const snippet = (text || "").slice(0, 300).replace(/\s+/g, " ");
+    const err: any = new Error(`Expected JSON response from ${url} — got: ${snippet}`);
+    err.status = res.status;
+    throw err;
+  }
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    const err: any = new Error(`Invalid JSON response from ${url}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (!res.ok) {
+    const msg = json?.message ?? json?.error ?? `HTTP ${res.status}`;
+    const err: any = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return json;
 }
 
 export default function PortfolioCreate() {
@@ -45,31 +105,51 @@ export default function PortfolioCreate() {
   const [collab, setCollab] = useState("");
   const [images, setImages] = useState<LocalImage[]>([]);
   const [saving, setSaving] = useState(false);
+  const [booting, setBooting] = useState(true);
 
-  // ambil auth
+  // bootstrap once
   useEffect(() => {
+    let mounted = true;
     (async () => {
+      setBooting(true);
       try {
-        const raw = await SecureStore.getItemAsync("auth");
-        if (raw) {
-          const auth = JSON.parse(raw);
-          if (auth?.token) setToken(auth.token);
-          setMuaId(auth?.profile?.id || auth?.user?.id || null);
+        const { token: t, profileId } = await bootstrapAuth();
+        if (!mounted) return;
+        setToken(t);
+        if (profileId) {
+          setMuaId(profileId);
+          setBooting(false);
+          return;
         }
-      } catch {}
-      if (!muaId) {
-        try {
-          const res = await fetch(`${API}/auth/me`, {
-            headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-          });
-          if (res.ok) {
-            const me: Me = await res.json();
-            setMuaId(me?.profile?.id || me?.id || null);
+        // if no profileId but we have token, call /auth/me
+        if (t) {
+          try {
+            const json = await fetchJsonOrThrow(`${API}/auth/me`, {
+              headers: { Authorization: `Bearer ${t}` },
+            });
+            if (!mounted) return;
+            const me = json?.data ?? json;
+            const pid = me?.profile?.id ?? me?.id ?? null;
+            if (pid) setMuaId(String(pid));
+          } catch (e: any) {
+            // token invalid or server returned html (redirect) -> force user to login
+            console.warn("bootstrap /auth/me failed:", e?.message || e);
+            if (e?.status === 401) {
+              // delete stored auth and redirect
+              await SecureStore.deleteItemAsync("auth").catch(() => {});
+              Alert.alert("Sesi berakhir", "Silakan login kembali.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+            } else {
+              // non-401: show but allow form to continue (user can still submit if they have token)
+              Alert.alert("Info", "Tidak dapat memverifikasi profil. Jika masalah berlanjut, login ulang.");
+            }
           }
-        } catch {}
+        }
+      } finally {
+        if (mounted) setBooting(false);
       }
     })();
-  }, [token, muaId]);
+    return () => { mounted = false; };
+  }, [router]);
 
   const pickImages = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -104,20 +184,18 @@ export default function PortfolioCreate() {
 
   async function submit() {
     try {
-      if (!muaId) throw new Error("Akun MUA tidak dikenali.");
+      if (!muaId) throw new Error("Akun MUA tidak dikenali. Pastikan Anda sudah login.");
       if (!name.trim()) throw new Error("Nama portofolio wajib diisi.");
 
       setSaving(true);
 
-      // Siapkan FormData multipart
       const fd = new FormData();
-      // Jangan set Content-Type manual!
       fd.append("mua_id", muaId);
       fd.append("name", name.trim());
-      fd.append("makeup_type", makeupType.trim());
-      fd.append("collaboration", collab.trim());
+      if (makeupType.trim()) fd.append("makeup_type", makeupType.trim());
+      if (collab.trim()) fd.append("collaboration", collab.trim());
 
-      // Kompres dan lampirkan file
+      // compress & append
       for (const f of images) {
         const c = await compressToJpeg(f.uri);
         fd.append("photos[]", {
@@ -133,18 +211,25 @@ export default function PortfolioCreate() {
         headers: {
           Accept: "application/json",
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          "X-Req-Id": reqId, // opsional: bantu korelasi log backend
+          "X-Req-Id": reqId,
         },
         body: fd as any,
       });
 
       const text = await res.text();
-      const json = (() => {
-        try { return JSON.parse(text); } catch { return null; }
-      })();
+      let json: any = null;
+      try { json = JSON.parse(text); } catch {}
 
       if (!res.ok) {
-        const msg = json?.message || text || "Gagal menyimpan portofolio.";
+        // if HTML returned, include snippet
+        const snippet = (!json && text) ? text.slice(0, 300).replace(/\s+/g, " ") : undefined;
+        const msg = json?.message || json?.error || snippet || `Gagal menyimpan (status ${res.status})`;
+        if (res.status === 401) {
+          // force logout
+          await SecureStore.deleteItemAsync("auth").catch(() => {});
+          Alert.alert("Sesi berakhir", "Silakan login ulang.", [{ text: "OK", onPress: () => router.replace("/(auth)/login") }]);
+          return;
+        }
         throw new Error(msg);
       }
 
@@ -156,6 +241,15 @@ export default function PortfolioCreate() {
     } finally {
       setSaving(false);
     }
+  }
+
+  if (booting) {
+    return (
+      <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
+        <ActivityIndicator />
+        <Text style={{ color: MUTED, marginTop: 8 }}>Memverifikasi akun…</Text>
+      </View>
+    );
   }
 
   return (
@@ -188,7 +282,6 @@ export default function PortfolioCreate() {
           onChangeText={setCollab}
         />
 
-        {/* Pilih foto dari device */}
         <Text style={[styles.label, { marginBottom: 6 }]}>Foto</Text>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <TouchableOpacity onPress={pickImages} style={styles.secondaryBtn}>

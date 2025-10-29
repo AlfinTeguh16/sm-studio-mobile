@@ -1,4 +1,4 @@
-// app/(mua)/index.tsx
+// app/(mua)/(tabs)/index.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
@@ -13,17 +13,17 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import * as SecureStore from "expo-secure-store";
 import Svg, { Path, Defs, LinearGradient as SvgGrad, Stop, Rect } from "react-native-svg";
 import { ensureLocationPermission } from "../../../src/permissions";
 import { getAuthToken } from "../../../utils/authStorage";
 import { api } from "../../../lib/api";
 
-/* ================== Types ================== */
-type Me = {
-  id?: string; // profile id (UUID)
+/* ========== Types ========== */
+type MeResp = {
+  id?: string;
   name?: string;
   profile?: { id?: string; name?: string; role?: string };
+  data?: any;
 };
 
 type Booking = {
@@ -34,7 +34,7 @@ type Booking = {
   booking_date: string; // YYYY-MM-DD
   booking_time: string; // "HH:MM"
   status: "pending" | "confirmed" | "rejected" | "cancelled" | "completed";
-  updated_at?: string | null; // <-- ditambahkan: sumber bulan untuk "completed"
+  updated_at?: string | null;
 };
 
 type Portfolio = {
@@ -46,8 +46,8 @@ type Portfolio = {
 
 type SparkDatum = number;
 
-/* ================== Const ================== */
-const BASE_URL = "https://smstudio.my.id/api";
+/* ========== Consts ========== */
+const BASE_URL = "https://smstudio.my.id";
 const API_URL = `${BASE_URL}/api`;
 const API_BOOKINGS = `${API_URL}/bookings`;
 const API_PORTFOLIOS = `${API_URL}/portfolios`;
@@ -58,19 +58,21 @@ const MUTED = "#6B7280";
 const BORDER = "#E5E7EB";
 const CARD_BG = "#F7F2FA";
 
-/* ================== Utils ================== */
+/* ========== Helpers ========== */
 const fmtDateTimeShort = (isoDate: string, hhmm: string) => {
   const d = new Date(`${isoDate}T${hhmm}:00`);
-  return `${d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })} - ${d.toLocaleDateString("id-ID", {
-    day: "2-digit",
-    month: "long",
-    year: "numeric",
-  })}`;
+  return `${d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })} - ${d.toLocaleDateString(
+    "id-ID",
+    {
+      day: "2-digit",
+      month: "long",
+      year: "numeric",
+    }
+  )}`;
 };
 
 const toJSDate = (b: Booking) => new Date(`${b.booking_date}T${b.booking_time}:00`);
 
-// Ambil bulan "completed" dari updated_at (fallback ke booking_date/time)
 const monthFromUpdatedOrBooking = (b: Booking): number | null => {
   if (b.updated_at) {
     const d = new Date(b.updated_at);
@@ -87,17 +89,9 @@ const normPhoto = (u?: string | null) => {
   return u;
 };
 
-/* ================== Tiny Sparkline ================== */
-function Sparkline({
-  data,
-  width = 320,
-  height = 120,
-}: {
-  data: SparkDatum[];
-  width?: number;
-  height?: number;
-}) {
-  if (!data.length) return <View style={{ width, height, backgroundColor: "#fff" }} />;
+/* ========== Sparkline ========== */
+function Sparkline({ data, width = 320, height = 120 }: { data: SparkDatum[]; width?: number; height?: number }) {
+  if (!data || data.length === 0) return <View style={{ width, height, backgroundColor: "#fff" }} />;
   const max = Math.max(...data);
   const min = Math.min(...data);
   const pad = 8;
@@ -130,48 +124,63 @@ function Sparkline({
   );
 }
 
-/* ================== Screen ================== */
+/* ========== Screen ========== */
 export default function MuaDashboard() {
   const router = useRouter();
 
-  const [me, setMe] = useState<{ id?: string; name?: string }>({});
+  // beri generics eksplisit — mencegah never[]
+  const [me, setMe] = useState<{ id?: string; name?: string } | null>(null);
   const [token, setToken] = useState<string | null>(null);
 
   const [bookings, setBookings] = useState<Booking[]>([]);
-  const [loadingBookings, setLoadingBookings] = useState(true);
+  const [loadingBookings, setLoadingBookings] = useState<boolean>(true);
 
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
-  const [loadingPortfolios, setLoadingPortfolios] = useState(true);
+  const [loadingPortfolios, setLoadingPortfolios] = useState<boolean>(true);
 
-  // ambil token & me
+  // ambil token & me (safe)
   useEffect(() => {
     (async () => {
       try {
-        const token = await getAuthToken();
-        if (token) {
-          setToken(token);
-          // Ambil data user dari API
-          const response = await api.me();
-          console.log("ME response:", response); // Untuk debugging
-          if (response) {
-            // Coba ambil ID dan nama dari berbagai kemungkinan struktur response
-            const id = response.profile?.id || response.id || response.user?.id || response.data?.id;
-            const name = response.profile?.name || response.name || response.user?.name || response.data?.name;
-            if (id) setMe({ id, name });
+        const t = await getAuthToken();
+        if (t) setToken(t);
+
+        // coba helper api.me() jika tersedia
+        let resp: any = null;
+        try {
+          resp = await api.me();
+        } catch {
+          // fallback to raw fetch
+          try {
+            const res = await fetch(`${API_URL}/auth/me`, {
+              headers: { Accept: "application/json", ...(t ? { Authorization: `Bearer ${t}` } : {}) },
+            });
+            resp = await res.json().catch(() => null);
+          } catch {
+            resp = null;
           }
         }
-      } catch (error) {
-        console.warn("Error fetching user data:", error);
+
+        if (resp) {
+          const body = resp?.data ?? resp;
+          const id = body?.profile?.id ?? body?.id ?? (body?.user && body.user.id) ?? undefined;
+          const name = body?.profile?.name ?? body?.name ?? (body?.user && body.user.name) ?? undefined;
+          setMe({ id, name });
+        } else {
+          setMe(null);
+        }
+      } catch (err) {
+        console.warn("error loading me:", err);
+        setMe(null);
       }
     })();
   }, []);
 
-  // fetch SEMUA bookings via /api/bookings (paginate until done) -> filter by mua_id & completed di server
+  /* ========== bookings fetch (completed for metrics) ========== */
   useEffect(() => {
-    if (!me.id) return;
+    if (!me?.id) return;
 
     let alive = true;
-
     (async () => {
       setLoadingBookings(true);
       try {
@@ -182,21 +191,12 @@ export default function MuaDashboard() {
           `${API_BOOKINGS}?mua_id=${encodeURIComponent(String(me.id))}` +
           `&status=completed&per_page=${perPage}&page=${page}`;
 
-        while (nextUrl) {
-          const response: Response = await fetch(nextUrl, {
-            headers: {
-              Accept: "application/json",
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            },
+        while (nextUrl && alive) {
+          const response = await fetch(nextUrl, {
+            headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
           });
-          const json: any = await response.json().catch(() => ({} as any));
-
-          const pageData: Booking[] = Array.isArray(json?.data)
-            ? (json.data as Booking[])
-            : Array.isArray(json)
-              ? (json as Booking[])
-              : [];
-
+          const json: any = await response.json().catch(() => ({}));
+          const pageData: Booking[] = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
           all = all.concat(pageData);
 
           if (json?.next_page_url) {
@@ -209,11 +209,15 @@ export default function MuaDashboard() {
           } else {
             nextUrl = null;
           }
-          if (page > 20) nextUrl = null; // guard
+
+          if (page > 20) {
+            nextUrl = null; // guard
+          }
         }
 
         if (alive) setBookings(all);
-      } catch {
+      } catch (err) {
+        console.warn("fetch bookings error:", err);
         if (alive) setBookings([]);
       } finally {
         if (alive) setLoadingBookings(false);
@@ -223,11 +227,11 @@ export default function MuaDashboard() {
     return () => {
       alive = false;
     };
-  }, [me.id, token]);
+  }, [me?.id, token]);
 
-  // fetch portfolios (pakai ?muaId=…)
+  /* ========== portfolios fetch ========== */
   useEffect(() => {
-    if (!me.id) return;
+    if (!me?.id) return;
 
     let alive = true;
     (async () => {
@@ -235,15 +239,13 @@ export default function MuaDashboard() {
       try {
         const url = `${API_PORTFOLIOS}?muaId=${encodeURIComponent(String(me.id))}&per_page=20&sort=created_at&dir=desc`;
         const res = await fetch(url, {
-          headers: {
-            Accept: "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
+          headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         });
         const j = await res.json().catch(() => ({}));
         const rows: Portfolio[] = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : [];
         if (alive) setPortfolios(rows);
-      } catch {
+      } catch (err) {
+        console.warn("fetch portfolios error:", err);
         if (alive) setPortfolios([]);
       } finally {
         if (alive) setLoadingPortfolios(false);
@@ -253,25 +255,22 @@ export default function MuaDashboard() {
     return () => {
       alive = false;
     };
-  }, [me.id, token]);
+  }, [me?.id, token]);
 
-  // jadwal mendatang terdekat (pending|confirmed di masa depan)
-  const upcoming = useMemo(() => {
+  /* upcoming: cari booking pending/confirmed di masa depan dari 'bookings' */
+  const upcoming = useMemo<Booking | null>(() => {
     const now = new Date();
-    return bookings
-      .filter((b) => (b.status === "pending" || b.status === "confirmed") && toJSDate(b) >= now)
-      .sort((a, b) => +toJSDate(a) - +toJSDate(b))[0];
+    // bookings mungkin kosong; filter aman
+    const cand = bookings
+      .filter((b: Booking) => (b.status === "pending" || b.status === "confirmed") && toJSDate(b) >= now)
+      .sort((a: Booking, b: Booking) => +toJSDate(a) - +toJSDate(b));
+    return cand.length ? cand[0] : null;
   }, [bookings]);
 
-  // total selesai sepanjang waktu (dari /bookings)
-  const totalDoneAllTime = useMemo(
-    () => bookings.filter((b) => b.status === "completed").length,
-    [bookings]
-  );
+  const totalDoneAllTime = useMemo(() => bookings.filter((b) => b.status === "completed").length, [bookings]);
 
-  // jumlah selesai per bulan (menggunakan updated_at sebagai sumber bulan)
   const completedByMonth = useMemo(() => {
-    const byMonth = new Array(12).fill(0);
+    const byMonth = new Array<number>(12).fill(0);
     bookings.forEach((b) => {
       if (b.status !== "completed") return;
       const m = monthFromUpdatedOrBooking(b);
@@ -280,32 +279,27 @@ export default function MuaDashboard() {
     return byMonth;
   }, [bookings]);
 
-  // total selesai bulan ini
   const totalDoneThisMonth = useMemo(() => {
     const m = new Date().getMonth();
     return completedByMonth[m] || 0;
   }, [completedByMonth]);
 
-  // total pekerjaan selesai (completed saja) — milik user login (redundan karena fetch sudah filter by mua_id)
   const totalDone = useMemo(
-    () => bookings.filter((b) => b.status === "completed" && b.mua_id === me.id).length,
-    [bookings, me.id]
+    () => bookings.filter((b) => b.status === "completed" && b.mua_id === me?.id).length,
+    [bookings, me?.id]
   );
 
-  // data grafik: count completed per bulan berdasarkan updated_at (fallback booking_date/time)
   const chartData = useMemo(() => {
-    const byMonth = new Array(12).fill(0);
+    const byMonth = new Array<number>(12).fill(0);
     bookings.forEach((b) => {
-      if (b.status !== "completed" || b.mua_id !== me.id) return;
+      if (b.status !== "completed" || b.mua_id !== me?.id) return;
       const m = monthFromUpdatedOrBooking(b);
       if (m != null) byMonth[m] += 1;
     });
     return byMonth;
-  }, [bookings, me.id]);
+  }, [bookings, me?.id]);
 
-  /* ------------------ Fetch helpers ------------------ */
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
-
   async function onGetLocation() {
     try {
       const pos = await ensureLocationPermission();
@@ -315,26 +309,18 @@ export default function MuaDashboard() {
     }
   }
 
-
-
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 24 }}>
-
-      {/* Header */}
       <View style={styles.header}>
-        <View>
-          <Text style={styles.hello}>Hello, {me.name || "MUA"}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.hello}>Hello, {me?.name ?? "MUA"}</Text>
           <Text style={styles.subtitle}>Let's make a great things today!</Text>
         </View>
-        <TouchableOpacity
-          style={styles.bell}
-          onPress={() => router.push("notifications")}
-        >
+        <TouchableOpacity style={styles.bell} onPress={() => router.push("notifications")}>
           <Ionicons name="notifications-outline" size={18} color="#fff" />
         </TouchableOpacity>
       </View>
 
-      {/* Jadwal Mendatang */}
       <LinearGradient colors={[PURPLE, PURPLE_2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.nextCard}>
         <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
           <Text style={styles.nextTitle}>Jadwal Mendatang</Text>
@@ -360,19 +346,14 @@ export default function MuaDashboard() {
           <TouchableOpacity
             disabled={!upcoming}
             style={[styles.nextBtn, !upcoming && { opacity: 0.6 }]}
-            onPress={() =>
-              upcoming && router.push({ pathname: "/(mua)/bookings/[id]", params: { id: String(upcoming.id) } })
-            }
+            onPress={() => upcoming && router.push({ pathname: "/(mua)/bookings/[id]", params: { id: String(upcoming.id) } })}
           >
             <Text style={{ fontWeight: "700", color: PURPLE }}>Cek Detail</Text>
           </TouchableOpacity>
-          <Text style={styles.nextTime}>
-            {upcoming ? fmtDateTimeShort(upcoming.booking_date, upcoming.booking_time) : "—"}
-          </Text>
+          <Text style={styles.nextTime}>{upcoming ? fmtDateTimeShort(upcoming.booking_date, upcoming.booking_time) : "—"}</Text>
         </View>
       </LinearGradient>
 
-      {/* Grafik pekerjaan: jumlah completed per bulan (updated_at) */}
       <View style={{ paddingHorizontal: 20, marginTop: 18 }}>
         <Text style={styles.blockTitle}>Pekerjaan Selesai per Bulan</Text>
         <View style={styles.chartCard}>
@@ -386,7 +367,6 @@ export default function MuaDashboard() {
         </View>
       </View>
 
-      {/* KPI */}
       <View style={{ paddingHorizontal: 20, marginTop: 12 }}>
         <View style={styles.kpiCard}>
           <Text style={styles.kpiTitle}>Total Pekerjaan Selesai</Text>
@@ -397,15 +377,10 @@ export default function MuaDashboard() {
         </View>
       </View>
 
-      {/* Portofolio */}
       <View style={{ paddingHorizontal: 20, marginTop: 18 }}>
         <Text style={styles.blockTitle}>Portofolio</Text>
 
-        <TouchableOpacity
-          style={styles.addBtn}
-          onPress={() => router.push("/(mua)/portfolio/new")}
-          activeOpacity={0.9}
-        >
+        <TouchableOpacity style={styles.addBtn} onPress={() => router.push("/(mua)/portfolio/new")} activeOpacity={0.9}>
           <Text style={{ color: "#fff", fontWeight: "800" }}>Tambah Portofolio</Text>
         </TouchableOpacity>
 
@@ -414,11 +389,11 @@ export default function MuaDashboard() {
         ) : portfolios.length === 0 ? (
           <Text style={{ color: MUTED, marginTop: 8 }}>Belum ada portofolio.</Text>
         ) : (
-          portfolios.map((p) => {
+          portfolios.map((p: Portfolio) => {
             const first = Array.isArray(p.photos) ? p.photos[0] : null;
             const cover = normPhoto(first) || "https://via.placeholder.com/600x400.png?text=Portfolio";
             return (
-              <View key={p.id} style={styles.portCard}>
+              <View key={String(p.id)} style={styles.portCard}>
                 <Image source={{ uri: cover }} style={styles.portPhoto} />
                 <View style={{ flex: 1, padding: 12 }}>
                   <Text style={styles.portTitle} numberOfLines={2}>
@@ -430,10 +405,7 @@ export default function MuaDashboard() {
                       <Text style={styles.metaValue}>{p.makeup_type}</Text>
                     </>
                   )}
-                  <TouchableOpacity
-                    style={styles.portBtn}
-                    onPress={() => router.push({ pathname: "/(mua)/portfolio/[id]", params: { id: String(p.id) } })}
-                  >
+                  <TouchableOpacity style={styles.portBtn} onPress={() => router.push({ pathname: "/(mua)/portfolio/[id]", params: { id: String(p.id) } })}>
                     <Text style={{ color: "#fff", fontWeight: "700" }}>Detail</Text>
                   </TouchableOpacity>
                 </View>
@@ -446,7 +418,7 @@ export default function MuaDashboard() {
   );
 }
 
-/* ================== Styles ================== */
+/* ========== Styles ========== */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#fff" },
 
@@ -457,7 +429,7 @@ const styles = StyleSheet.create({
     gap: 10,
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center"
+    alignItems: "center",
   },
   hello: { fontSize: 20, fontWeight: "600", color: "#111827", flexWrap: "wrap", flex: 1, marginRight: 10 },
   bell: { backgroundColor: PURPLE, width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
