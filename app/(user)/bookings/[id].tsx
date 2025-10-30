@@ -1,4 +1,3 @@
-// app/(user)/bookings/[id].tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
@@ -14,11 +13,11 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import * as SecureStore from "expo-secure-store";
 import * as Clipboard from "expo-clipboard";
+import authStorage from "../../../utils/authStorage"; // ✅ GUNAKAN AUTH STORAGE YANG SAMA
 
 /* ============== Debug & Console Helpers ============== */
-const DEBUG_ALERT = true; // set ke false saat production
+const DEBUG_ALERT = false; // set ke false saat production
 const LOG_NS = "[BookingInvoice]";
 
 function debugAlert(title: string, payload?: any) {
@@ -34,9 +33,9 @@ function debugAlert(title: string, payload?: any) {
   if (msg.length > 1200) msg = msg.slice(0, 1200) + "…(truncated)";
   Alert.alert(`[DEBUG] ${title}`, msg || "(no details)");
 }
-function log(...args: any[]) { console.log(LOG_NS, ...args); }          // eslint-disable-line no-console
-function warn(...args: any[]) { console.warn(LOG_NS, ...args); }         // eslint-disable-line no-console
-function error(...args: any[]) { console.error(LOG_NS, ...args); }       // eslint-disable-line no-console
+function log(...args: any[]) { console.log(LOG_NS, ...args); }
+function warn(...args: any[]) { console.warn(LOG_NS, ...args); }
+function error(...args: any[]) { console.error(LOG_NS, ...args); }
 
 /* ===================== Types ===================== */
 type Booking = {
@@ -117,49 +116,56 @@ function fmtDate(idt?: string | null) {
 
 type HeaderMap = Record<string, string>;
 
-async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
-  }
-}
+// ✅ GUNAKAN AUTH STORAGE YANG SAMA
 async function getAuthHeaders(): Promise<HeaderMap> {
-  const token = await getAuthToken();
-  const h: HeaderMap = { Accept: "application/json" };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
+  try {
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
+  }
 }
 
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
-  const given = (init.headers || {}) as HeaderMap;
-  const headers: HeadersInit = { ...given, Accept: "application/json" };
-
-  const res = await fetch(url, {
-    method: init.method ?? "GET",
-    cache: "no-store",
-    ...init,
-    headers,
-  });
-
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-
-  if (!res.ok) {
-    if (res.status === 401) {
-      await SecureStore.deleteItemAsync("auth").catch(() => {});
-      throw new Error("401_UNAUTH");
-    }
-    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
-  }
-
   try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+    const given = (init.headers || {}) as HeaderMap;
+    const headers: HeadersInit = { ...given, Accept: "application/json" };
+
+    const res = await fetch(url, {
+      method: init.method ?? "GET",
+      cache: "no-store",
+      ...init,
+      headers,
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        console.log("[safeFetchJSON] 401 Unauthorized - Clearing auth");
+        await authStorage.clearAuthAll();
+        throw new Error("401_UNAUTH");
+      }
+      throw new Error(`HTTP ${res.status} — ${text.slice(0, 160)}`);
+    }
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Unexpected non-JSON — ${text.slice(0, 160)}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "401_UNAUTH") {
+      throw error;
+    }
+    console.warn("[safeFetchJSON] Network error:", error);
+    throw new Error("Network error: " + (error instanceof Error ? error.message : String(error)));
   }
 }
 
@@ -188,6 +194,7 @@ export default function BookingInvoiceScreen() {
 
   useEffect(() => {
     if (!id) return;
+    
     (async () => {
       const group = `${LOG_NS} fetch:${id}`;
       console.groupCollapsed(group);
@@ -235,10 +242,24 @@ export default function BookingInvoiceScreen() {
         error("fetch error", e?.message || e);
         if (e?.message === "401_UNAUTH") {
           debugAlert("Auth expired / 401", { id, error: e?.message });
-          router.replace("/(auth)/login");
+          Alert.alert("Sesi Berakhir", "Silakan login kembali.", [
+            {
+              text: "OK",
+              onPress: () => {
+                router.replace("/(auth)/login");
+              }
+            }
+          ]);
         } else {
           debugAlert("Load invoice gagal", { id, error: e?.message });
-          router.replace("/(user)/(tabs)/booking");
+          Alert.alert("Error", "Gagal memuat detail booking: " + (e.message || "Unknown error"), [
+            {
+              text: "Kembali",
+              onPress: () => {
+                router.replace("/(user)/(tabs)/booking");
+              }
+            }
+          ]);
         }
       } finally {
         setLoading(false);
@@ -269,20 +290,20 @@ export default function BookingInvoiceScreen() {
     return "#F59E0B";
   }, [booking]);
 
-  // WhatsApp CTA — sukses: buka WA, tanpa alert sukses
+  // WhatsApp CTA
   const onPressPesan = async () => {
     const group = `${LOG_NS} wa:${booking?.id}`;
     console.groupCollapsed(group);
     try {
       if (!mua) {
         warn("MUA belum siap", { bookingId: booking?.id });
-        debugAlert("MUA belum siap", { bookingId: booking?.id });
+        Alert.alert("Info", "Data MUA belum tersedia. Silakan coba lagi nanti.");
         return;
       }
       const intl = normalizePhoneToID(mua.phone || undefined);
       if (!intl) {
         warn("Nomor WA kosong/invalid", { phone: mua?.phone });
-        debugAlert("Nomor WA MUA kosong/invalid", { phone: mua?.phone });
+        Alert.alert("Info", "Nomor WhatsApp MUA tidak tersedia.");
         return;
       }
 
@@ -308,11 +329,11 @@ export default function BookingInvoiceScreen() {
         await Linking.openURL(waUrl);
       } else {
         warn("Tidak bisa open WhatsApp", { waUrl });
-        debugAlert("Tidak bisa membuka WhatsApp", { waUrl });
+        Alert.alert("Error", "Tidak dapat membuka WhatsApp. Pastikan aplikasi WhatsApp terinstall.");
       }
     } catch (err: any) {
       error("WA open error", err?.message || err);
-      debugAlert("Error saat open WhatsApp", err?.message || err);
+      Alert.alert("Error", "Gagal membuka WhatsApp: " + (err.message || "Unknown error"));
     } finally {
       console.groupEnd();
     }
@@ -321,15 +342,27 @@ export default function BookingInvoiceScreen() {
   if (loading) {
     return (
       <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <ActivityIndicator />
+        <ActivityIndicator size="large" color={PURPLE} />
+        <Text style={{ marginTop: 12, color: MUTED }}>Memuat detail booking...</Text>
       </View>
     );
   }
 
   if (!booking) {
-    debugAlert("Booking null setelah load", { id });
-    router.replace("/(user)/(tabs)/booking");
-    return null;
+    return (
+      <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
+        <Ionicons name="alert-circle-outline" size={64} color={MUTED} />
+        <Text style={{ marginTop: 12, color: MUTED, textAlign: "center" }}>
+          Tidak dapat memuat data booking
+        </Text>
+        <TouchableOpacity
+          style={[styles.secondaryButton, { marginTop: 16 }]}
+          onPress={() => router.replace("/(user)/(tabs)/booking")}
+        >
+          <Text style={{ color: PURPLE, fontWeight: "700" }}>Kembali ke Pesanan</Text>
+        </TouchableOpacity>
+      </View>
+    );
   }
 
   const title = offering?.name_offer || "Paket/Jasa";
@@ -374,7 +407,7 @@ export default function BookingInvoiceScreen() {
                 });
               } catch (err: any) {
                 error("share error", err?.message || err);
-                debugAlert("Share error", err?.message || err);
+                Alert.alert("Error", "Gagal berbagi invoice: " + (err.message || "Unknown error"));
               }
             }}
           >
@@ -412,13 +445,17 @@ export default function BookingInvoiceScreen() {
         <Text style={styles.sectionTitle}>Ringkasan Pembayaran</Text>
 
         <Row label="Subtotal" value={formatIDR(computed.subtotal)} />
-        <Row label="Diskon" value={`- ${formatIDR(computed.discount)}`} />
-        <Row label="Pajak" value={formatIDR(computed.taxAmount)} />
+        {computed.discount > 0 && (
+          <Row label="Diskon" value={`- ${formatIDR(computed.discount)}`} />
+        )}
+        {computed.taxAmount > 0 && (
+          <Row label="Pajak" value={formatIDR(computed.taxAmount)} />
+        )}
         <View style={[styles.divider, { marginVertical: 10 }]} />
         <Row label="Total" value={formatIDR(computed.grand)} bold />
 
         <View style={{ marginTop: 16, gap: 10 }}>
-          {/* Copy tanpa Alert sukses */}
+          {/* Copy invoice number */}
           <TouchableOpacity
             style={[styles.btn, { backgroundColor: PURPLE }]}
             onPress={async () => {
@@ -429,22 +466,27 @@ export default function BookingInvoiceScreen() {
                 setTimeout(() => setCopied(false), 1500);
               } catch (err: any) {
                 error("copy invoice error", err?.message || err);
-                debugAlert("Copy invoice gagal", err?.message || err);
+                Alert.alert("Error", "Gagal menyalin invoice: " + (err.message || "Unknown error"));
               }
             }}
           >
-            <Text style={{ color: "#fff", fontWeight: "800" }}>Salin No. Invoice</Text>
+            <Text style={{ color: "#fff", fontWeight: "800" }}>
+              {copied ? "Tersalin!" : "Salin No. Invoice"}
+            </Text>
           </TouchableOpacity>
-          {copied ? <Text style={styles.copiedText}>Tersalin</Text> : null}
 
-          {/* Pesan Sekarang */}
+          {/* Pesan Sekarang via WhatsApp */}
           <TouchableOpacity
-            style={[styles.btn, { backgroundColor: canMessage ? "#25D366" : "#C7C7C7" }]}
+            style={[styles.btn, { 
+              backgroundColor: canMessage ? "#25D366" : MUTED,
+              opacity: canMessage ? 1 : 0.6
+            }]}
             onPress={onPressPesan}
             disabled={!canMessage}
           >
-            <Text style={{ color: "#fff", fontWeight: "800" }}>
-              {canMessage ? "Pesan Sekarang (WhatsApp)" : "Nomor WA tidak tersedia"}
+            <Ionicons name="logo-whatsapp" size={20} color="#fff" style={{ marginRight: 8 }} />
+            <Text style={{ color: "#fff", fontWeight: "800", fontSize: 16 }}>
+              {canMessage ? "Hubungi MUA via WhatsApp" : "Nomor WA tidak tersedia"}
             </Text>
           </TouchableOpacity>
 
@@ -455,9 +497,26 @@ export default function BookingInvoiceScreen() {
               router.replace("/(user)/(tabs)/booking");
             }}
           >
-            <Text style={{ color: "#111827", fontWeight: "800" }}>Kembali ke Pesanan</Text>
+            <Text style={{ color: "#111827", fontWeight: "800" }}>Kembali ke Daftar Pesanan</Text>
           </TouchableOpacity>
         </View>
+      </View>
+
+      {/* Informasi tambahan */}
+      <View style={styles.infoCard}>
+        <Text style={styles.infoTitle}>Informasi Penting</Text>
+        <Text style={styles.infoText}>
+          • Simpan nomor invoice untuk referensi pembayaran
+        </Text>
+        <Text style={styles.infoText}>
+          • Hubungi MUA minimal 1 hari sebelum jadwal booking
+        </Text>
+        <Text style={styles.infoText}>
+          • Pembayaran dapat dilakukan via transfer atau cash
+        </Text>
+        <Text style={styles.infoText}>
+          • Batalkan booking minimal 24 jam sebelumnya jika tidak jadi
+        </Text>
       </View>
     </ScrollView>
   );
@@ -468,7 +527,7 @@ function Row({ label, value, bold = false }: { label: string; value: string; bol
   return (
     <View style={styles.rowBetween}>
       <Text style={[styles.rowLabel]}>{label}</Text>
-      <Text style={[styles.rowValue, bold && { fontWeight: "800" }]} numberOfLines={2}>
+      <Text style={[styles.rowValue, bold && { fontWeight: "800", fontSize: 16 }]} numberOfLines={2}>
         {value}
       </Text>
     </View>
@@ -477,14 +536,18 @@ function Row({ label, value, bold = false }: { label: string; value: string; bol
 
 /* ============== Styles ============== */
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 8, android: 4 }) },
+  screen: { 
+    flex: 1, 
+    backgroundColor: "#fff", 
+    paddingTop: Platform.select({ ios: 8, android: 4 }) 
+  },
 
   header: {
     height: 46,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 12,
+    paddingHorizontal: 16,
     marginBottom: 8,
   },
   back: {
@@ -495,41 +558,100 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  headerTitle: { fontWeight: "800", fontSize: 18, color: "#111827" },
+  headerTitle: { 
+    fontWeight: "800", 
+    fontSize: 18, 
+    color: "#111827" 
+  },
 
   card: {
     marginHorizontal: 16,
     marginTop: 10,
-    padding: 14,
+    padding: 16,
     borderWidth: 1,
     borderColor: BORDER,
     borderRadius: 12,
     backgroundColor: "#fff",
   },
-  rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  infoCard: {
+    marginHorizontal: 16,
+    marginTop: 10,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 12,
+    backgroundColor: "#F9FAFB",
+  },
+  rowBetween: { 
+    flexDirection: "row", 
+    alignItems: "center", 
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
   badge: {
     borderWidth: 1,
-    paddingVertical: 4,
-    paddingHorizontal: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
     borderRadius: 999,
     flexDirection: "row",
     alignItems: "center",
   },
-  invNo: { fontSize: 22, fontWeight: "800", color: "#111827", marginTop: 8 },
+  invNo: { 
+    fontSize: 22, 
+    fontWeight: "800", 
+    color: "#111827", 
+    marginTop: 8 
+  },
 
-  sectionTitle: { fontWeight: "800", color: "#111827", marginBottom: 8 },
-  title: { fontSize: 16, fontWeight: "800", color: "#111827" },
+  sectionTitle: { 
+    fontWeight: "800", 
+    color: "#111827", 
+    marginBottom: 12,
+    fontSize: 18,
+  },
+  infoTitle: {
+    fontWeight: "800",
+    color: "#111827",
+    marginBottom: 8,
+    fontSize: 16,
+  },
+  infoText: {
+    color: MUTED,
+    marginBottom: 4,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  title: { 
+    fontSize: 18, 
+    fontWeight: "800", 
+    color: "#111827",
+    marginBottom: 4,
+  },
 
-  divider: { height: 1, backgroundColor: BORDER, opacity: 0.8 },
+  divider: { 
+    height: 1, 
+    backgroundColor: BORDER, 
+    opacity: 0.8 
+  },
 
-  rowLabel: { color: MUTED, marginRight: 12 },
-  rowValue: { color: "#111827", maxWidth: "60%", textAlign: "right" },
+  rowLabel: { 
+    color: MUTED, 
+    marginRight: 12,
+    fontSize: 14,
+  },
+  rowValue: { 
+    color: "#111827", 
+    maxWidth: "60%", 
+    textAlign: "right",
+    fontSize: 14,
+  },
 
   btn: {
-    height: 48,
+    height: 52,
     borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
+    flexDirection: "row",
   },
 
   iconBtn: {
@@ -541,12 +663,12 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  copiedText: {
-    alignSelf: "center",
-    marginTop: -6,
-    marginBottom: 6,
-    fontSize: 12,
-    color: "#10B981",
-    fontWeight: "700",
+  secondaryButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: PURPLE,
+    alignItems: "center",
   },
 });
