@@ -4,8 +4,8 @@ import {
   RefreshControl, Alert, Platform
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import * as SecureStore from "expo-secure-store";
 import { useRouter } from "expo-router";
+import authStorage from "../../../utils/authStorage"; // ✅ GUNAKAN AUTH STORAGE YANG SAMA
 
 const API = "https://smstudio.my.id/api";
 const API_LIST = `${API}/notifications`;
@@ -31,19 +31,45 @@ type Notif = {
   created_at?: string;
 };
 
-type Paged<T> = { data: T[]; current_page: number; last_page: number; per_page: number; total: number };
+type Paged<T> = { 
+  data: T[]; 
+  current_page: number; 
+  last_page: number; 
+  per_page: number; 
+  total: number 
+};
 
-async function getToken(){ try{ const raw = await SecureStore.getItemAsync("auth"); if(!raw) return null; const j = JSON.parse(raw); return j?.token||null; }catch{ return null; } }
+// ✅ GUNAKAN AUTH STORAGE YANG SAMA
+async function getAuthHeaders() {
+  try {
+    const token = await authStorage.getAuthToken();
+    const headers: Record<string, string> = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
+  }
+}
+
 const fmtTime = (iso?: string)=> {
   if(!iso) return "-";
   const d = new Date(iso);
   if(!Number.isFinite(+d)) return iso;
-  return d.toLocaleString("id-ID",{ day:"2-digit", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit" });
+  return d.toLocaleString("id-ID",{ 
+    day:"2-digit", 
+    month:"long", 
+    year:"numeric", 
+    hour:"2-digit", 
+    minute:"2-digit" 
+  });
 };
 
 export default function NotificationsScreen(){
   const router = useRouter();
-  const [token, setToken] = useState<string|null>(null);
 
   const [items, setItems] = useState<Notif[]>([]);
   const [page, setPage] = useState(1);
@@ -53,40 +79,50 @@ export default function NotificationsScreen(){
   const [busy, setBusy] = useState(false);
   const [unreadCount, setUnreadCount] = useState<number>(0);
 
-  // ambil token
-  useEffect(()=>{ (async()=>{ setToken(await getToken()); })(); },[]);
-
-  const headers = useMemo(()=>({
-    Accept: "application/json",
-    ...(token? { Authorization: `Bearer ${token}` } : {})
-  }),[token]);
-
   const fetchUnread = useCallback(async ()=>{
     try{
+      const headers = await getAuthHeaders();
       const res = await fetch(API_UNREAD, { headers, cache:"no-store" });
+      
+      if (res.status === 401) {
+        await authStorage.clearAuthAll();
+        router.replace("/(auth)/login");
+        return;
+      }
+      
       const j = await res.json();
       setUnreadCount(Number(j?.count||0));
-    }catch{}
-  },[headers]);
+    }catch(error){
+      console.warn("[fetchUnread] Error:", error);
+    }
+  },[router]);
 
   const fetchPage = useCallback(async (p=1)=>{
+    const headers = await getAuthHeaders();
     const url = `${API_LIST}?per_page=20&page=${p}`;
     const res = await fetch(url, { headers, cache:"no-store" });
     const txt = await res.text();
-    if(!res.ok){
+    
+    if (!res.ok) {
+      if (res.status === 401) {
+        await authStorage.clearAuthAll();
+        router.replace("/(auth)/login");
+        throw new Error("Sesi berakhir. Silakan login kembali.");
+      }
+      
       let msg = `HTTP ${res.status}`;
       try{ msg = JSON.parse(txt)?.message || msg; }catch{}
       throw new Error(msg);
     }
+    
     const j: Paged<Notif>|Notif[] = JSON.parse(txt);
     const list = Array.isArray((j as any)?.data) ? (j as any).data : (Array.isArray(j) ? j : []);
-    const last = (j as any)?.last_page ?? (list.length<20 ? 1 : p); // fallback
+    const last = (j as any)?.last_page ?? (list.length<20 ? 1 : p);
     return { list, lastPage: Number(last)||p };
-  },[headers]);
+  },[router]);
 
   // initial load
   useEffect(()=>{
-    if(!token) { setLoading(false); return; }
     (async()=>{
       try{
         setLoading(true);
@@ -96,13 +132,16 @@ export default function NotificationsScreen(){
         setHasMore(1 < lastPage);
         fetchUnread();
       }catch(e:any){
-        Alert.alert("Oops", e?.message || "Gagal memuat notifikasi");
+        console.error("[NotificationsScreen] Initial load error:", e);
+        if (e?.message !== "Sesi berakhir. Silakan login kembali.") {
+          Alert.alert("Oops", e?.message || "Gagal memuat notifikasi");
+        }
         setItems([]);
       }finally{
         setLoading(false);
       }
     })();
-  },[token, fetchPage, fetchUnread]);
+  },[fetchPage, fetchUnread]);
 
   const onRefresh = useCallback(async ()=>{
     setRefreshing(true);
@@ -112,8 +151,14 @@ export default function NotificationsScreen(){
       setPage(1);
       setHasMore(1 < lastPage);
       fetchUnread();
-    }catch{}
-    setRefreshing(false);
+    }catch(e: any){
+      console.error("[NotificationsScreen] Refresh error:", e);
+      if (e?.message !== "Sesi berakhir. Silakan login kembali.") {
+        Alert.alert("Error", "Gagal memuat ulang notifikasi");
+      }
+    }finally{
+      setRefreshing(false);
+    }
   },[fetchPage, fetchUnread]);
 
   const loadMore = useCallback(async ()=>{
@@ -125,37 +170,107 @@ export default function NotificationsScreen(){
       setItems(prev=>[...prev, ...list]);
       setPage(next);
       setHasMore(next < lastPage);
-    }catch{}finally{ setBusy(false); }
+    }catch(e: any){
+      console.error("[NotificationsScreen] Load more error:", e);
+      if (e?.message !== "Sesi berakhir. Silakan login kembali.") {
+        Alert.alert("Error", "Gagal memuat lebih banyak notifikasi");
+      }
+    }finally{ 
+      setBusy(false); 
+    }
   },[page, fetchPage, hasMore, loading, busy]);
 
   // actions
   const markRead = async (id: string|number, read=true)=>{
     try{
-      await fetch(API_READ(id), { method:"PATCH", headers:{ ...headers, "Content-Type":"application/json" }, body: JSON.stringify({ is_read: read }) });
+      const headers = await getAuthHeaders();
+      await fetch(API_READ(id), { 
+        method:"PATCH", 
+        headers, 
+        body: JSON.stringify({ is_read: read }) 
+      });
       setItems(prev=>prev.map(n=> n.id===id ? { ...n, is_read: read } : n));
       fetchUnread();
-    }catch{}
+    }catch(error){
+      console.warn("[markRead] Error:", error);
+      Alert.alert("Error", "Gagal menandai notifikasi");
+    }
   };
+
   const deleteOne = async (id: string|number)=>{
-    try{
-      await fetch(API_DEL(id), { method:"DELETE", headers });
-      setItems(prev=>prev.filter(n=> n.id!==id));
-      fetchUnread();
-    }catch{}
+    Alert.alert(
+      "Hapus Notifikasi",
+      "Apakah Anda yakin ingin menghapus notifikasi ini?",
+      [
+        { text: "Batal", style: "cancel" },
+        { 
+          text: "Hapus", 
+          style: "destructive",
+          onPress: async () => {
+            try{
+              const headers = await getAuthHeaders();
+              await fetch(API_DEL(id), { method:"DELETE", headers });
+              setItems(prev=>prev.filter(n=> n.id!==id));
+              fetchUnread();
+            }catch(error){
+              console.warn("[deleteOne] Error:", error);
+              Alert.alert("Error", "Gagal menghapus notifikasi");
+            }
+          }
+        },
+      ]
+    );
   };
+
   const markAllRead = async ()=>{
-    try{
-      await fetch(API_READ_ALL, { method:"PATCH", headers });
-      setItems(prev=>prev.map(n=> ({...n, is_read:true})));
-      fetchUnread();
-    }catch{}
+    Alert.alert(
+      "Tandai Semua Dibaca",
+      "Apakah Anda yakin ingin menandai semua notifikasi sebagai sudah dibaca?",
+      [
+        { text: "Batal", style: "cancel" },
+        { 
+          text: "Tandai Semua", 
+          onPress: async () => {
+            try{
+              const headers = await getAuthHeaders();
+              await fetch(API_READ_ALL, { method:"PATCH", headers });
+              setItems(prev=>prev.map(n=> ({...n, is_read:true})));
+              fetchUnread();
+              Alert.alert("Berhasil", "Semua notifikasi telah ditandai sebagai dibaca");
+            }catch(error){
+              console.warn("[markAllRead] Error:", error);
+              Alert.alert("Error", "Gagal menandai semua notifikasi sebagai dibaca");
+            }
+          }
+        },
+      ]
+    );
   };
+
   const clearRead = async ()=>{
-    try{
-      await fetch(`${API_DEL_ALL}?only_read=true`, { method:"DELETE", headers });
-      setItems(prev=>prev.filter(n=> !n.is_read));
-      fetchUnread();
-    }catch{}
+    Alert.alert(
+      "Bersihkan Notifikasi Dibaca",
+      "Apakah Anda yakin ingin menghapus semua notifikasi yang sudah dibaca?",
+      [
+        { text: "Batal", style: "cancel" },
+        { 
+          text: "Bersihkan", 
+          style: "destructive",
+          onPress: async () => {
+            try{
+              const headers = await getAuthHeaders();
+              await fetch(`${API_DEL_ALL}?only_read=true`, { method:"DELETE", headers });
+              setItems(prev=>prev.filter(n=> !n.is_read));
+              fetchUnread();
+              Alert.alert("Berhasil", "Notifikasi yang sudah dibaca telah dihapus");
+            }catch(error){
+              console.warn("[clearRead] Error:", error);
+              Alert.alert("Error", "Gagal membersihkan notifikasi yang sudah dibaca");
+            }
+          }
+        },
+      ]
+    );
   };
 
   const renderItem = ({ item }: { item: Notif })=>{
@@ -170,17 +285,31 @@ export default function NotificationsScreen(){
           <Text style={{ color, fontWeight:"800", fontSize:12 }}>{item.type.toUpperCase()}</Text>
         </View>
         <View style={{ flex:1 }}>
-          <Text style={[styles.title, !item.is_read && { color:TEXT }]} numberOfLines={2}>{item.title}</Text>
+          <Text style={[styles.title, !item.is_read && { color:TEXT, fontWeight: "800" }]} numberOfLines={2}>
+            {item.title}
+          </Text>
           <Text style={styles.msg} numberOfLines={2}>{item.message}</Text>
           <Text style={styles.time}>{fmtTime(item.created_at)}</Text>
         </View>
 
         {/* Quick actions */}
         <View style={{ marginLeft:10, alignItems:"flex-end", gap:8 }}>
-          <TouchableOpacity onPress={()=> markRead(item.id, !item.is_read)} style={styles.iconBtn}>
-            <Ionicons name={item.is_read? "mail-open-outline":"mail-unread-outline"} size={18} color="#111" />
+          <TouchableOpacity 
+            onPress={()=> markRead(item.id, !item.is_read)} 
+            style={styles.iconBtn}
+            accessibilityLabel={item.is_read ? "Tandai belum dibaca" : "Tandai sudah dibaca"}
+          >
+            <Ionicons 
+              name={item.is_read? "mail-open-outline":"mail-unread-outline"} 
+              size={18} 
+              color={item.is_read ? MUTED : PURPLE} 
+            />
           </TouchableOpacity>
-          <TouchableOpacity onPress={()=> deleteOne(item.id)} style={[styles.iconBtn,{ backgroundColor:"#FEE2E2", borderColor:"#FCA5A5" }]}>
+          <TouchableOpacity 
+            onPress={()=> deleteOne(item.id)} 
+            style={[styles.iconBtn,{ backgroundColor:"#FEE2E2", borderColor:"#FCA5A5" }]}
+            accessibilityLabel="Hapus notifikasi"
+          >
             <Ionicons name="trash-outline" size={18} color="#DC2626" />
           </TouchableOpacity>
         </View>
@@ -191,7 +320,12 @@ export default function NotificationsScreen(){
   };
 
   if(loading){
-    return <View style={styles.center}><ActivityIndicator color={PURPLE}/><Text style={{ color:MUTED, marginTop:6 }}>Memuat…</Text></View>;
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color={PURPLE}/>
+        <Text style={{ color:MUTED, marginTop:12 }}>Memuat notifikasi…</Text>
+      </View>
+    );
   }
 
   return (
@@ -201,56 +335,235 @@ export default function NotificationsScreen(){
         <Text style={styles.headerTitle}>Notifikasi</Text>
         <View style={{ flexDirection:"row", gap:8 }}>
           <TouchableOpacity onPress={markAllRead} style={styles.hBtn}>
-            <Ionicons name="checkmark-done-outline" size={16} color="#111" />
+            <Ionicons name="checkmark-done-outline" size={16} color={PURPLE} />
             <Text style={styles.hBtnText}>Tandai Baca</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={clearRead} style={styles.hBtn}>
-            <Ionicons name="trash-outline" size={16} color="#111" />
-            <Text style={styles.hBtnText}>Bersihkan Dibaca</Text>
+            <Ionicons name="trash-outline" size={16} color="#DC2626" />
+            <Text style={styles.hBtnText}>Bersihkan</Text>
           </TouchableOpacity>
         </View>
       </View>
 
       {/* Counter */}
-      <View style={styles.counterRow}>
-        <Text style={{ color:MUTED }}>Belum dibaca</Text>
-        <View style={styles.counterBadge}>
-          <Text style={{ color:"#fff", fontWeight:"800" }}>{unreadCount}</Text>
+      {unreadCount > 0 && (
+        <View style={styles.counterRow}>
+          <Text style={{ color:MUTED }}>Notifikasi belum dibaca</Text>
+          <View style={styles.counterBadge}>
+            <Text style={{ color:"#fff", fontWeight:"800", fontSize:12 }}>{unreadCount}</Text>
+          </View>
         </View>
-      </View>
+      )}
 
       <FlatList
         data={items}
         keyExtractor={(it)=> String(it.id)}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        contentContainerStyle={{ paddingHorizontal:16, paddingBottom:24 }}
+        refreshControl={
+          <RefreshControl 
+            refreshing={refreshing} 
+            onRefresh={onRefresh}
+            colors={[PURPLE]}
+            tintColor={PURPLE}
+          />
+        }
+        contentContainerStyle={{ 
+          paddingHorizontal:16, 
+          paddingBottom:24,
+          flex: items.length === 0 ? 1 : undefined 
+        }}
         ItemSeparatorComponent={()=> <View style={{ height:10 }}/>}
         renderItem={renderItem}
         onEndReachedThreshold={0.3}
         onEndReached={loadMore}
-        ListFooterComponent={busy? <ActivityIndicator style={{ marginTop:8 }}/>: null}
-        ListEmptyComponent={<Text style={{ color:MUTED, padding:16 }}>Tidak ada notifikasi.</Text>}
+        ListFooterComponent={
+          busy ? (
+            <View style={styles.footerLoader}>
+              <ActivityIndicator color={PURPLE} />
+              <Text style={styles.footerText}>Memuat lebih banyak...</Text>
+            </View>
+          ) : null
+        }
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            <Ionicons name="notifications-off-outline" size={64} color={MUTED} />
+            <Text style={styles.emptyTitle}>Tidak ada notifikasi</Text>
+            <Text style={styles.emptyText}>
+              Notifikasi baru akan muncul di sini
+            </Text>
+            <TouchableOpacity 
+              style={styles.refreshButton}
+              onPress={onRefresh}
+            >
+              <Text style={styles.refreshButtonText}>Muat Ulang</Text>
+            </TouchableOpacity>
+          </View>
+        }
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  screen:{ flex:1, backgroundColor:"#fff", paddingTop: Platform.select({ ios: 8, android: 4 }) },
-  center:{ flex:1, alignItems:"center", justifyContent:"center", backgroundColor:"#fff" },
-  header:{ paddingHorizontal:16, paddingVertical:10, flexDirection:"row", justifyContent:"space-between", alignItems:"center" },
-  headerTitle:{ fontWeight:"800", fontSize:18, color:TEXT },
-  hBtn:{ flexDirection:"row", alignItems:"center", gap:6, paddingHorizontal:10, height:34, borderRadius:8, borderWidth:1, borderColor:BORDER, backgroundColor:"#fff" },
-  hBtnText:{ color:"#111827", fontWeight:"700" },
+  screen:{ 
+    flex:1, 
+    backgroundColor:"#fff", 
+    paddingTop: Platform.select({ ios: 12, android: 8 }) 
+  },
+  center:{ 
+    flex:1, 
+    alignItems:"center", 
+    justifyContent:"center", 
+    backgroundColor:"#fff" 
+  },
+  header:{ 
+    paddingHorizontal:16, 
+    paddingVertical:12, 
+    flexDirection:"row", 
+    justifyContent:"space-between", 
+    alignItems:"center",
+    borderBottomWidth: 1,
+    borderBottomColor: BORDER,
+  },
+  headerTitle:{ 
+    fontWeight:"800", 
+    fontSize:20, 
+    color:TEXT 
+  },
+  hBtn:{ 
+    flexDirection:"row", 
+    alignItems:"center", 
+    gap:6, 
+    paddingHorizontal:12, 
+    height:36, 
+    borderRadius:8, 
+    borderWidth:1, 
+    borderColor:BORDER, 
+    backgroundColor:"#fff" 
+  },
+  hBtnText:{ 
+    color:"#111827", 
+    fontWeight:"600",
+    fontSize: 12,
+  },
 
-  counterRow:{ flexDirection:"row", alignItems:"center", justifyContent:"space-between", paddingHorizontal:16, paddingBottom:6 },
-  counterBadge:{ backgroundColor:PURPLE, paddingHorizontal:10, height:26, borderRadius:13, alignItems:"center", justifyContent:"center" },
+  counterRow:{ 
+    flexDirection:"row", 
+    alignItems:"center", 
+    justifyContent:"space-between", 
+    paddingHorizontal:16, 
+    paddingVertical: 12,
+    backgroundColor: "#F8FAFF",
+    marginHorizontal: 16,
+    marginTop: 12,
+    borderRadius: 8,
+  },
+  counterBadge:{ 
+    backgroundColor:PURPLE, 
+    paddingHorizontal:12, 
+    height:24, 
+    borderRadius:12, 
+    alignItems:"center", 
+    justifyContent:"center",
+    minWidth: 24,
+  },
 
-  card:{ borderWidth:1, borderColor:BORDER, backgroundColor:"#fff", borderRadius:12, padding:12, flexDirection:"row", alignItems:"center" },
-  badgeType:{ borderWidth:1, paddingVertical:4, paddingHorizontal:8, borderRadius:999, marginRight:10 },
-  title:{ fontWeight:"800", color:TEXT },
-  msg:{ color:MUTED, marginTop:4 },
-  time:{ color:MUTED, marginTop:6, fontSize:12 },
-  iconBtn:{ width:34, height:34, borderRadius:8, borderWidth:1, borderColor:BORDER, backgroundColor:"#fff", alignItems:"center", justifyContent:"center" },
-  unreadDot:{ position:"absolute", right:8, top:8, width:10, height:10, borderRadius:5, backgroundColor:"#EF4444" },
+  card:{ 
+    borderWidth:1, 
+    borderColor:BORDER, 
+    backgroundColor:"#fff", 
+    borderRadius:12, 
+    padding:16, 
+    flexDirection:"row", 
+    alignItems:"flex-start",
+    position: "relative",
+  },
+  badgeType:{ 
+    borderWidth:1, 
+    paddingVertical:4, 
+    paddingHorizontal:8, 
+    borderRadius:6, 
+    marginRight:12,
+    alignSelf: 'flex-start',
+  },
+  title:{ 
+    fontWeight:"600", 
+    color:TEXT,
+    fontSize: 15,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  msg:{ 
+    color:MUTED, 
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  time:{ 
+    color:MUTED, 
+    marginTop:8, 
+    fontSize:12 
+  },
+  iconBtn:{ 
+    width:36, 
+    height:36, 
+    borderRadius:8, 
+    borderWidth:1, 
+    borderColor:BORDER, 
+    backgroundColor:"#fff", 
+    alignItems:"center", 
+    justifyContent:"center" 
+  },
+  unreadDot:{ 
+    position:"absolute", 
+    right:12, 
+    top:12, 
+    width:8, 
+    height:8, 
+    borderRadius:4, 
+    backgroundColor:"#EF4444" 
+  },
+
+  footerLoader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 16,
+    gap: 8,
+  },
+  footerText: {
+    color: MUTED,
+    fontSize: 14,
+  },
+
+  emptyContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 60,
+    paddingHorizontal: 40,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: TEXT,
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  emptyText: {
+    fontSize: 14,
+    color: MUTED,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 24,
+  },
+  refreshButton: {
+    backgroundColor: PURPLE,
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  refreshButtonText: {
+    color: '#fff',
+    fontWeight: '600',
+    fontSize: 14,
+  },
 });
