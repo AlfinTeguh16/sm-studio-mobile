@@ -1,18 +1,15 @@
-// app/_layout.tsx
 import { Stack, SplashScreen, useRouter, useSegments } from "expo-router";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { View, ActivityIndicator, Text, StyleSheet } from "react-native";
 import { useFonts, Inter_400Regular, Inter_600SemiBold } from "@expo-google-fonts/inter";
 import { SafeAreaView } from "react-native-safe-area-context";
 import LocationProvider from "app/providers/LocationProvider";
-import { getAuthToken, getUserProfile, setUserProfile } from "../utils/authStorage";
-import { api } from "../lib/api";
+import { getAuthToken, getUserProfile, setUserProfile, clearAuthAll } from "../utils/authStorage";
 
-// Cegah splash screen disembunyikan otomatis
 SplashScreen.preventAutoHideAsync().catch(() => { });
 
-const FONT_LOAD_TIMEOUT = 3000; // ms
-const LOADER_MAX_TIMEOUT = 10000; // ms
+const FONT_LOAD_TIMEOUT = 3000;
+const LOADER_MAX_TIMEOUT = 10000;
 
 export default function RootLayout() {
   const router = useRouter();
@@ -29,7 +26,6 @@ export default function RootLayout() {
   const splashHiddenRef = useRef(false);
   const forcedReadyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Fungsi idempoten untuk menyembunyikan splash
   const hideSplash = useCallback(async () => {
     if (splashHiddenRef.current) return;
     try {
@@ -41,7 +37,6 @@ export default function RootLayout() {
     }
   }, []);
 
-  // Sembunyikan splash jika font sudah dimuat atau timeout
   useEffect(() => {
     if (splashHiddenRef.current) return;
 
@@ -57,14 +52,44 @@ export default function RootLayout() {
     return () => clearTimeout(fontTimeout);
   }, [fontsLoaded, hideSplash]);
 
-  // Boot logic: auth check, routing, dan kesiapan aplikasi
+  const validateTokenWithAPI = async (token: string): Promise<boolean> => {
+    try {
+      console.log("[BOOT] Validating token with API...");
+      
+      const response = await fetch('https://smstudio.my.id/api/auth/me', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+        },
+      });
+
+      console.log("[BOOT] Token validation response status:", response.status);
+      
+      if (response.ok) {
+        const userData = await response.json();
+        console.log("[BOOT] Token valid, user data received");
+        await setUserProfile(userData);
+        return true;
+      } else if (response.status === 401) {
+        console.log("[BOOT] Token invalid (401)");
+        return false;
+      } else {
+        console.warn("[BOOT] Token validation failed with status:", response.status);
+        return true; // Tetap lanjut untuk error selain 401
+      }
+    } catch (error) {
+      console.warn("[BOOT] Token validation API call failed:", error);
+      return true; // Lanjut dengan cached token jika API error
+    }
+  };
+
   useEffect(() => {
     if (didBootRef.current) return;
     didBootRef.current = true;
 
     let mounted = true;
 
-    // Mulai timer safety (maksimal 10 detik)
     forcedReadyTimerRef.current = setTimeout(() => {
       if (mounted && !ready) {
         console.log("[BOOT] forcing ready due to timeout");
@@ -81,56 +106,72 @@ export default function RootLayout() {
         const token = await getAuthToken();
         let profile = await getUserProfile();
 
-        // Jika ada token tapi tidak ada profile, coba ambil dari API
-        if (token && !profile) {
-          try {
-            const userData = await api.me();
-            if (userData) {
-              await setUserProfile(userData);
-              profile = await getUserProfile();
-            }
-          } catch (error) {
-            console.warn("[BOOT] Failed to fetch user data:", error);
-            // Jika gagal mengambil data user, hapus token dan arahkan ke login
-            await setUserProfile(null);
-            return router.replace("/(auth)/login");
-          }
-        }
+        console.log(`[BOOT] token: ${!!token}, profile:`, profile ? `exists (role: ${profile.role})` : 'null');
 
-        // Log dengan aman
-        try {
-          const profileStr = profile ? JSON.stringify(profile) : "null";
-          console.log(`[BOOT] token: ${!!token} profile: ${profileStr}`);
-        } catch {
-          console.log(`[BOOT] token: ${!!token} profile: (unserializable)`);
+        // Jika ada token, validasi dengan API
+        if (token) {
+          const isTokenValid = await validateTokenWithAPI(token);
+          
+          if (!isTokenValid) {
+            console.log("[BOOT] Token invalid, clearing auth and redirecting to login");
+            await clearAuthAll();
+            
+            if (mounted) {
+              setTimeout(() => {
+                router.replace("/(auth)/login");
+              }, 100);
+            }
+            return;
+          }
+          
+          // Token valid, ambil profile terbaru
+          profile = await getUserProfile();
+          console.log("[BOOT] Token valid, profile:", profile);
         }
 
         const role = String(profile?.role ?? "").toLowerCase().trim();
         const currentGroup = initialSegmentsRef.current[0] || "";
 
-        if (!token) {
-          console.log("[BOOT] no token — remain in auth flow");
+        console.log(`[BOOT] role: ${role}, currentGroup: '${currentGroup}'`);
+
+        if (!token || !profile) {
+          console.log("[BOOT] no token or profile — redirect to login");
           if (currentGroup !== "(auth)") {
-            router.replace("/(auth)/login");
+            setTimeout(() => {
+              router.replace("/(auth)/login");
+            }, 100);
           }
         } else {
           const isMua = role.includes("mua") || role.includes("makeup");
+          console.log(`[BOOT] User is MUA: ${isMua}`);
+          
           if (isMua) {
             if (currentGroup !== "(mua)") {
               console.log("[BOOT] redirecting to (mua)");
-              router.replace("/(mua)/");
+              setTimeout(() => {
+                router.replace("/(mua)");
+              }, 100);
+            } else {
+              console.log("[BOOT] already in (mua), no redirect needed");
             }
           } else {
-            if (["(mua)", "(auth)"].includes(currentGroup)) {
+            // User biasa (customer) - PERBAIKAN DI SINI!
+            if (currentGroup === "(mua)" || currentGroup === "(auth)" || currentGroup === "") {
               console.log("[BOOT] redirecting to / (user)");
-              router.replace("/");
+              setTimeout(() => {
+                router.replace("/(user)");
+              }, 100);
+            } else {
+              console.log("[BOOT] already in user section, no redirect needed");
             }
           }
         }
       } catch (err) {
         console.warn("[_layout auth boot] error:", err);
+        setTimeout(() => {
+          router.replace("/(auth)/login");
+        }, 100);
       } finally {
-        // ✅ Pastikan timer dibatalkan karena boot sudah selesai
         if (forcedReadyTimerRef.current) {
           clearTimeout(forcedReadyTimerRef.current);
           forcedReadyTimerRef.current = null;
@@ -147,7 +188,9 @@ export default function RootLayout() {
       }
     };
 
-    bootApp();
+    setTimeout(() => {
+      bootApp();
+    }, 300);
 
     return () => {
       mounted = false;
@@ -156,27 +199,34 @@ export default function RootLayout() {
         forcedReadyTimerRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router, hideSplash]);
 
   const showLoader = !ready || !splashHiddenRef.current;
 
+  if (showLoader) {
+    return (
+      <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
+        <View style={styles.inner}>
+          <View style={styles.loaderContainer}>
+            <ActivityIndicator size="large" color="#AA60C8" />
+            <Text style={styles.loaderText}>Memuat aplikasi…</Text>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <View style={styles.inner}>
-        {showLoader ? (
-          <View style={styles.loaderContainer}>
-            <ActivityIndicator size="large" />
-            <Text style={styles.loaderText}>Memuat aplikasi…</Text>
-            <Text style={styles.debugText}>
-              Debug: ready={String(ready)}, splashHidden={String(splashHiddenRef.current)}
-            </Text>
-          </View>
-        ) : (
-          <LocationProvider>
-            <Stack screenOptions={{ headerShown: false }} />
-          </LocationProvider>
-        )}
+        <LocationProvider>
+          <Stack screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+            <Stack.Screen name="(user)" options={{ headerShown: false }} />
+            <Stack.Screen name="(mua)" options={{ headerShown: false }} />
+            <Stack.Screen name="index" options={{ headerShown: false }} />
+          </Stack>
+        </LocationProvider>
       </View>
     </SafeAreaView>
   );
@@ -185,7 +235,15 @@ export default function RootLayout() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#fff" },
   inner: { flex: 1 },
-  loaderContainer: { flex: 1, alignItems: "center", justifyContent: "center" },
-  loaderText: { marginTop: 8, color: "#6B7280" },
-  debugText: { marginTop: 8, color: "#9CA3AF", fontSize: 12 },
+  loaderContainer: { 
+    flex: 1, 
+    alignItems: "center", 
+    justifyContent: "center",
+    backgroundColor: "#fff"
+  },
+  loaderText: { 
+    marginTop: 12, 
+    color: "#6B7280",
+    fontSize: 16
+  },
 });

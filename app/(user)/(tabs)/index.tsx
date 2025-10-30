@@ -1,4 +1,3 @@
-// app/(user)/(tabs)/index.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
@@ -16,9 +15,9 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import MapView, { Marker, Region } from "react-native-maps";
-import * as SecureStore from "expo-secure-store";
 import { useRouter } from "expo-router";
 import { useUserLocation } from "../../providers/LocationProvider";
+import authStorage from "../../../utils/authStorage";
 
 /* ---------- Types ---------- */
 type MuaApi = {
@@ -41,7 +40,7 @@ type Mua = {
   address?: string | null;
   lat?: number | null;
   lng?: number | null;
-  photo: string; // URL absolut / placeholder
+  photo: string;
   distanceKm?: number;
   services?: string[] | null;
   is_online?: boolean;
@@ -77,32 +76,35 @@ const PLACEHOLDER_AVATAR = "https://via.placeholder.com/96x96.png?text=MUA";
 /* ---------- Helpers ---------- */
 type HeaderMap = Record<string, string>;
 
-async function getAuthToken(): Promise<string | null> {
+/** Use centralized token getter from utils/authStorage */
+async function getAuthHeaders(): Promise<HeaderMap> {
   try {
-    const raw = await SecureStore.getItemAsync("auth");
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { Accept: "application/json" };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  } catch (e) {
+    return { Accept: "application/json" };
   }
 }
-async function getAuthHeaders(): Promise<HeaderMap> {
-  const token = await getAuthToken();
-  const h: HeaderMap = { Accept: "application/json" };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
+
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
   const given = (init.headers || {}) as HeaderMap;
   const headers: HeadersInit = { ...given, Accept: "application/json" };
   const res = await fetch(url, { method: init.method ?? "GET", cache: "no-store", ...init, headers });
   const ct = res.headers.get("content-type") || "";
   const text = await res.text();
+
   if (!res.ok) {
-    if (res.status === 401) throw new Error("401_UNAUTH");
-    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
+    if (res.status === 401) {
+      // Auto logout ketika token invalid
+      await authStorage.clearAuthAll();
+      throw new Error("401_UNAUTH");
+    }
+    const snippet = text ? text.slice(0, 300).replace(/\s+/g, " ") : "";
+    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${snippet}`);
   }
+
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -150,7 +152,7 @@ function resolvePhotoUrl(u?: string | null): string {
   return `${API_ORIGIN}/${s.replace(/^\/+/, "")}`;
 }
 
-/** Parse services (stringified JSON or CSV) */
+/** Parse services (stringified JSON atau CSV) */
 function parseServices(s?: string | string[] | null): string[] | null {
   if (!s) return null;
   if (Array.isArray(s)) return s;
@@ -195,6 +197,10 @@ function Img({
 export default function UserDashboard() {
   const router = useRouter();
   const mountedRef = useRef(true);
+  
+  // 🔥 PERBAIKAN: State untuk auto login check
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -213,7 +219,7 @@ export default function UserDashboard() {
 
   // All MUA (includes ones without coords)
   const [allMua, setAllMua] = useState<Mua[]>([]);
-  const baseMuaRef = useRef<Mua[]>([]); // store raw normalized list for recompute when userCoords changes
+  const baseMuaRef = useRef<Mua[]>([]);
   const [nearbyLoading, setNearbyLoading] = useState(true);
   const [muaMap, setMuaMap] = useState<Record<string, Mua>>({});
 
@@ -236,92 +242,155 @@ export default function UserDashboard() {
       ({ finished }) => finished && setFilterOpen(false)
     );
 
-  /* --- Ambil nama user: SecureStore -> /auth/me -> fallback /mua --- */
+  /* --- 🔥 PERBAIKAN: Auto Login Check --- */
   useEffect(() => {
+    checkAutoLogin();
+  }, []);
+
+  const checkAutoLogin = async () => {
+    try {
+      const token = await authStorage.getAuthToken();
+      const profile = await authStorage.getUserProfile();
+      
+      console.log("[AUTO_LOGIN] Token:", !!token, "Profile:", !!profile);
+      
+      if (token && profile) {
+        // Token ada, validasi dengan API
+        try {
+          const headers = await getAuthHeaders();
+          const response = await fetch(`${API_BASE}/auth/me`, { 
+            headers,
+            method: 'GET'
+          });
+          
+          if (response.ok) {
+            // Auto login berhasil, update profile jika perlu
+            const userData = await response.json();
+            await authStorage.setUserProfile(userData);
+            if (mountedRef.current) {
+              setDisplayName(userData.name || profile.name || "User");
+            }
+            console.log("[AUTO_LOGIN] Success");
+          } else {
+            // Token expired, clear auth data
+            console.log("[AUTO_LOGIN] Token expired, clearing auth");
+            await authStorage.clearAuthAll();
+            if (mountedRef.current) {
+              router.replace("/(auth)/login");
+            }
+          }
+        } catch (error) {
+          console.warn("[AUTO_LOGIN] API validation failed:", error);
+          await authStorage.clearAuthAll();
+          if (mountedRef.current) {
+            router.replace("/(auth)/login");
+          }
+        }
+      } else {
+        // Tidak ada token, redirect ke login
+        console.log("[AUTO_LOGIN] No token found, redirect to login");
+        if (mountedRef.current) {
+          router.replace("/(auth)/login");
+        }
+      }
+    } catch (error) {
+      console.error("[AUTO_LOGIN] Failed:", error);
+      await authStorage.clearAuthAll();
+      if (mountedRef.current) {
+        router.replace("/(auth)/login");
+      }
+    } finally {
+      if (mountedRef.current) {
+        setIsCheckingAuth(false);
+      }
+    }
+  };
+
+  /* --- Ambil nama user: try cached profile -> try /auth/me with token -> fallback /mua --- */
+  useEffect(() => {
+    if (isCheckingAuth) return; // Tunggu sampai auth check selesai
+    
     (async () => {
       try {
-        const authStr = await SecureStore.getItemAsync("auth");
-        if (authStr) {
-          const auth = JSON.parse(authStr || "{}");
-          const nm = auth?.user?.name || auth?.profile?.name;
-          if (nm && mountedRef.current) {
+        // 1) try cached profile stored by authStorage
+        const cached = await authStorage.getUserProfile();
+        if (cached && (cached.name || cached.id) && mountedRef.current) {
+          const nm = cached.name ?? "";
+          if (nm) {
             setDisplayName(String(nm));
             return;
           }
-          if (auth?.token) {
+        }
+
+        // 2) try to call /auth/me using centralized token
+        const token = await authStorage.getAuthToken();
+        if (token) {
+          try {
             const me = await safeFetchJSON<any>(`${API_BASE}/auth/me`, {
-              headers: { Authorization: `Bearer ${auth.token}` },
+              headers: { Authorization: `Bearer ${token}` },
             });
-            const n2 = me?.name || me?.profile?.name;
+            const n2 = me?.name || me?.profile?.name || me?.user?.name;
             if (n2 && mountedRef.current) {
               setDisplayName(String(n2));
               return;
             }
+          } catch (e: any) {
+            console.warn("auth/me failed while booting displayName:", e?.message ?? e);
+            if (String(e?.message) === "401_UNAUTH") {
+              await authStorage.clearAuthAll();
+              router.replace("/(auth)/login");
+            }
           }
         }
-      } catch {}
+      } catch (e) {
+        console.warn("Failed reading auth storage for displayName:", e);
+      }
+
+      // 3) fallback: fetch MUA list (public)
       try {
         const data = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS);
         const list: MuaApi[] = (data as any)?.data ?? (data as MuaApi[]) ?? [];
         const first = list[0];
         if (first?.name && mountedRef.current) setDisplayName(String(first.name));
-      } catch {}
+      } catch (e) {
+        console.warn("Fallback fetch MUA for displayName failed:", (e as Error).message);
+      }
     })();
-  }, []);
+  }, [isCheckingAuth]);
 
-  /* --- Fetch MUA (only) --- */
+  /* --- Fetch MUA (only) with auth retry logic --- */
   useEffect(() => {
+    if (isCheckingAuth) return; // Tunggu sampai auth check selesai
+    
     let alive = true;
     (async () => {
       setNearbyLoading(true);
       try {
+        // try with auth headers first (if any)
         const headers = await getAuthHeaders();
-        const json = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS, { headers });
-        const arr: MuaApi[] = (json as any)?.data ?? (json as MuaApi[]) ?? [];
-
-        const onlyMua = arr.filter((x) => String(x.role ?? "").toLowerCase() === "mua");
-
-        const normalized: Mua[] = onlyMua.map((x) => {
-          const lat = toNumber(x.location_lat);
-          const lng = toNumber(x.location_lng);
-          return {
-            id: String(x.id),
-            name: String(x.name ?? "MUA"),
-            address: x.address ?? "-",
-            lat: lat == null ? undefined : lat,
-            lng: lng == null ? undefined : lng,
-            photo: resolvePhotoUrl(x.photo_url),
-            services: parseServices(x.services),
-            is_online: x.is_online === 1 || x.is_online === true,
-            phone: x.phone ?? null,
-          } as Mua;
-        });
-
-        // store base list (without distances) for recompute later
-        baseMuaRef.current = normalized;
-
-        // build map
-        const mmap: Record<string, Mua> = {};
-        normalized.forEach((m) => (mmap[m.id] = m));
-        if (alive && mountedRef.current) setMuaMap(mmap);
-
-        // if userCoords already available, compute distances immediately
-        if (userCoords) {
-          const rows = normalized
-            .map((m) => {
-              if (isFiniteNumber(m.lat!) && isFiniteNumber(m.lng!)) {
-                const d = haversine(userCoords.lat, userCoords.lng, m.lat!, m.lng!);
-                return { ...m, distanceKm: d };
-              }
-              return { ...m, distanceKm: undefined };
-            })
-            .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
-          if (alive && mountedRef.current) setAllMua(rows);
-        } else {
-          // set as-is; distances will be computed in separate effect when userCoords becomes available
-          if (alive && mountedRef.current) setAllMua(normalized);
+        try {
+          const json = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS, { headers });
+          const arr: MuaApi[] = (json as any)?.data ?? (json as MuaApi[]) ?? [];
+          processMuaArray(arr, alive);
+        } catch (err: any) {
+          if (String(err.message) === "401_UNAUTH") {
+            console.warn("Auth invalid — retrying MUA request without auth");
+            // retry without auth
+            try {
+              const json2 = await safeFetchJSON<{ data?: MuaApi[] } | MuaApi[]>(API_MUAS, {});
+              const arr2: MuaApi[] = (json2 as any)?.data ?? (json2 as MuaApi[]) ?? [];
+              processMuaArray(arr2, alive);
+            } catch (err2) {
+              console.warn("fetch MUA failed after retry:", (err2 as Error).message);
+              if (alive && mountedRef.current) setAllMua([]);
+            }
+          } else {
+            console.warn("fetch MUA failed:", err?.message ?? err);
+            if (alive && mountedRef.current) setAllMua([]);
+          }
         }
-      } catch {
+      } catch (e) {
+        console.warn("fetch MUA top-level error:", (e as Error).message);
         if (alive && mountedRef.current) setAllMua([]);
       } finally {
         if (alive && mountedRef.current) setNearbyLoading(false);
@@ -330,13 +399,50 @@ export default function UserDashboard() {
     return () => {
       alive = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // run once on mount; userCoords handled in separate effect below
+  }, [isCheckingAuth]);
+
+  function processMuaArray(arr: MuaApi[], alive: boolean) {
+    const onlyMua = arr.filter((x) => String(x.role ?? "").toLowerCase() === "mua");
+    const normalized: Mua[] = onlyMua.map((x) => {
+      const lat = toNumber(x.location_lat);
+      const lng = toNumber(x.location_lng);
+      return {
+        id: String(x.id),
+        name: String(x.name ?? "MUA"),
+        address: x.address ?? "-",
+        lat: lat == null ? undefined : lat,
+        lng: lng == null ? undefined : lng,
+        photo: resolvePhotoUrl(x.photo_url),
+        services: parseServices(x.services),
+        is_online: x.is_online === 1 || x.is_online === true,
+        phone: x.phone ?? null,
+      } as Mua;
+    });
+
+    baseMuaRef.current = normalized;
+    const mmap: Record<string, Mua> = {};
+    normalized.forEach((m) => (mmap[m.id] = m));
+    if (alive && mountedRef.current) setMuaMap(mmap);
+
+    if (userCoords) {
+      const rows = normalized
+        .map((m) => {
+          if (isFiniteNumber(m.lat!) && isFiniteNumber(m.lng!)) {
+            const d = haversine(userCoords.lat, userCoords.lng, m.lat!, m.lng!);
+            return { ...m, distanceKm: d };
+          }
+          return { ...m, distanceKm: undefined };
+        })
+        .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+      if (alive && mountedRef.current) setAllMua(rows);
+    } else {
+      if (alive && mountedRef.current) setAllMua(normalized);
+    }
+  }
 
   /* --- Recompute distances when userCoords becomes available --- */
   useEffect(() => {
     if (!userCoords) return;
-    // recompute using baseMuaRef (original normalized list)
     const normalized = baseMuaRef.current ?? [];
     if (normalized.length === 0) return;
     const rows = normalized
@@ -349,28 +455,39 @@ export default function UserDashboard() {
       })
       .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
     if (mountedRef.current) setAllMua(rows);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userCoords]);
 
-  /* --- Fetch offerings (gabungkan nama MUA dari muaMap jika ada) --- */
+  /* --- Fetch offerings (gabungkan nama MUA dari muaMap jika ada) with retry when 401 --- */
   useEffect(() => {
+    if (isCheckingAuth) return; // Tunggu sampai auth check selesai
+    
     let alive = true;
     (async () => {
       setOfferingsLoading(true);
       try {
         const headers = await getAuthHeaders();
-        const json = await safeFetchJSON<{ data?: OfferingApi[] } | OfferingApi[]>(API_OFFERINGS, { headers });
-        const list: OfferingApi[] = (json as any)?.data ?? (json as OfferingApi[]) ?? [];
-        const items: Offering[] = list.map((x) => ({
-          id: String(x.id),
-          title: x.name_offer ?? "Tanpa Judul",
-          vendor: muaMap[x.mua_id]?.name || "MUA",
-          mua_id: x.mua_id,
-          price: safeNum(x.price),
-          category: x.makeup_type ?? undefined,
-        }));
-        if (alive && mountedRef.current) setOfferings(items);
-      } catch {
+        try {
+          const json = await safeFetchJSON<{ data?: OfferingApi[] } | OfferingApi[]>(API_OFFERINGS, { headers });
+          const list: OfferingApi[] = (json as any)?.data ?? (json as OfferingApi[]) ?? [];
+          processOfferings(list, alive);
+        } catch (err: any) {
+          if (String(err.message) === "401_UNAUTH") {
+            console.warn("Auth invalid — retrying offerings request without auth");
+            try {
+              const json2 = await safeFetchJSON<{ data?: OfferingApi[] } | OfferingApi[]>(API_OFFERINGS, {});
+              const list2: OfferingApi[] = (json2 as any)?.data ?? (json2 as OfferingApi[]) ?? [];
+              processOfferings(list2, alive);
+            } catch (err2) {
+              console.warn("fetch offerings failed after retry:", (err2 as Error).message);
+              if (alive && mountedRef.current) setOfferings([]);
+            }
+          } else {
+            console.warn("fetch offerings failed:", err?.message ?? err);
+            if (alive && mountedRef.current) setOfferings([]);
+          }
+        }
+      } catch (e) {
+        console.warn("fetch offerings top-level error:", (e as Error).message);
         if (alive && mountedRef.current) setOfferings([]);
       } finally {
         if (alive && mountedRef.current) setOfferingsLoading(false);
@@ -379,7 +496,19 @@ export default function UserDashboard() {
     return () => {
       alive = false;
     };
-  }, [muaMap]);
+  }, [muaMap, isCheckingAuth]);
+
+  function processOfferings(list: OfferingApi[], alive: boolean) {
+    const items: Offering[] = list.map((x) => ({
+      id: String(x.id),
+      title: x.name_offer ?? "Tanpa Judul",
+      vendor: muaMap[x.mua_id]?.name || "MUA",
+      mua_id: x.mua_id,
+      price: safeNum(x.price),
+      category: x.makeup_type ?? undefined,
+    }));
+    if (alive && mountedRef.current) setOfferings(items);
+  }
 
   /* --- Pencarian --- */
   const filteredNearby = useMemo(() => {
@@ -427,6 +556,16 @@ export default function UserDashboard() {
     () => allMua.filter((m) => isFiniteNumber(m.lat ?? NaN) && isFiniteNumber(m.lng ?? NaN)),
     [allMua]
   );
+
+  // 🔥 PERBAIKAN: Tampilkan loading screen selama auth check
+  if (isCheckingAuth) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color={PURPLE} />
+        <Text style={styles.loadingText}>Memeriksa autentikasi...</Text>
+      </View>
+    );
+  }
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 36 }}>
@@ -673,9 +812,22 @@ function Section({
   );
 }
 
-/* ---------- Styles (sama seperti sebelumnya) ---------- */
+/* ---------- Styles ---------- */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#fff" },
+  
+  // 🔥 PERBAIKAN: Loading screen styles
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#fff",
+  },
+  loadingText: {
+    marginTop: 12,
+    color: "#6B7280",
+    fontSize: 16,
+  },
 
   header: {
     paddingHorizontal: 20,
