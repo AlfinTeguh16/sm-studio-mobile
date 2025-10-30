@@ -13,9 +13,9 @@ import {
   Image,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import * as SecureStore from "expo-secure-store";
 import * as Location from "expo-location";
 import { useRouter } from "expo-router";
+import authStorage from "../../../../utils/authStorage"; 
 
 /* ================= Types ================= */
 type MuaProfile = {
@@ -25,14 +25,13 @@ type MuaProfile = {
   phone?: string | null;
   bio?: string | null;
   photo_url?: string | null;
-  services?: string | string[] | null; // terkadang stringified JSON
+  services?: string | string[] | null;
   location_lat?: number | string | null;
   location_lng?: number | string | null;
   address?: string | null;
   is_online?: number | boolean | null;
   created_at?: string | null;
   updated_at?: string | null;
-  // price fields optional (tidak ada di contoh, tapi dipertahankan)
   starting_price?: number | null;
   min_price?: number | null;
   lowest_service_price?: number | null;
@@ -60,46 +59,62 @@ type HeaderMap = Record<string, string>;
 type FilterKey = "nearest" | "cheapest" | "expensive" | "newest";
 
 /* ================ Helpers ================================ */
-async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
+// ✅ GUNAKAN AUTH STORAGE YANG SAMA DENGAN APP LAIN
+async function getAuthHeaders(): Promise<HeaderMap> {
   try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
   }
 }
-async function getAuthHeaders(): Promise<HeaderMap> {
-  const token = await getAuthToken();
-  const h: HeaderMap = { Accept: "application/json" };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
+
 async function safeFetchJSON<T = any>(
   url: string,
   init: RequestInit = {}
 ): Promise<T> {
-  const given = (init.headers || {}) as HeaderMap;
-  const headers: HeadersInit = { ...given, Accept: "application/json" };
-  const res = await fetch(url, {
-    method: init.method ?? "GET",
-    cache: "no-store",
-    ...init,
-    headers,
-  });
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-  if (!res.ok) {
-    if (res.status === 401) throw new Error("401_UNAUTH");
-    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
-  }
   try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+    const given = (init.headers || {}) as HeaderMap;
+    const headers: HeadersInit = { ...given, Accept: "application/json" };
+    
+    const res = await fetch(url, {
+      method: init.method ?? "GET",
+      cache: "no-store",
+      ...init,
+      headers,
+    });
+    
+    const text = await res.text();
+    
+    if (!res.ok) {
+      if (res.status === 401) {
+        console.log("[safeFetchJSON] 401 Unauthorized - Clearing auth");
+        await authStorage.clearAuthAll();
+        throw new Error("401_UNAUTH");
+      }
+      throw new Error(`HTTP ${res.status} — ${text.slice(0, 160)}`);
+    }
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Unexpected non-JSON — ${text.slice(0, 160)}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "401_UNAUTH") {
+      throw error; // Re-throw auth errors
+    }
+    console.warn("[safeFetchJSON] Network error:", error);
+    throw new Error("Network error: " + (error instanceof Error ? error.message : String(error)));
   }
 }
+
 /** Haversine {km} */
 function distanceKm(
   a: { lat: number; lng: number },
@@ -115,17 +130,19 @@ function distanceKm(
     Math.sin(dLng / 2) ** 2 * Math.cos(sLat1) * Math.cos(sLat2);
   return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
+
 function formatIDR(n: number) {
   return n.toLocaleString("id-ID");
 }
+
 function getPrice(m: MuaProfile): number | null {
   if (typeof m.starting_price === "number") return m.starting_price;
   if (typeof m.min_price === "number") return m.min_price;
-  if (typeof m.lowest_service_price === "number")
-    return m.lowest_service_price;
+  if (typeof m.lowest_service_price === "number") return m.lowest_service_price;
   if (typeof m.price_from === "number") return m.price_from;
   return null;
 }
+
 function parseServices(s?: string | string[] | null): string[] | null {
   if (!s) return null;
   if (Array.isArray(s)) return s;
@@ -133,19 +150,19 @@ function parseServices(s?: string | string[] | null): string[] | null {
     const parsed = JSON.parse(s);
     if (Array.isArray(parsed)) return parsed;
   } catch {}
-  // assume comma separated
   return s
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
 }
+
 function resolvePhotoUrl(photo?: string | null) {
   if (!photo) return null;
   if (photo.startsWith("http://") || photo.startsWith("https://")) return photo;
   if (photo.startsWith("/")) return `${API_ORIGIN}${photo}`;
-  // fallback: assume already a relative path
   return `${API_ORIGIN}/${photo}`;
 }
+
 function initialsFromName(name?: string | null) {
   if (!name) return "M";
   const parts = name.trim().split(/\s+/);
@@ -167,29 +184,23 @@ export default function MuaListScreen() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const loadingMoreRef = useRef(false); // throttle guard
+  const loadingMoreRef = useRef(false);
 
   // UX/filter
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterKey>("nearest");
 
   // user location
-  const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(
-    null
-  );
+  const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
   const [locDenied, setLocDenied] = useState<boolean>(false);
 
-  // === Lokasi robust: cek layanan, izin, last known, current ===
+  // === Lokasi robust ===
   const requestLocation = useCallback(async () => {
     try {
       const servicesOn = await Location.hasServicesEnabledAsync();
       if (!servicesOn) {
         setLocDenied(true);
         setUserLoc(null);
-        Alert.alert(
-          "Lokasi nonaktif",
-          "Aktifkan layanan lokasi (GPS) di pengaturan perangkat."
-        );
         return;
       }
 
@@ -197,10 +208,6 @@ export default function MuaListScreen() {
       if (perm.status !== "granted") {
         setLocDenied(true);
         setUserLoc(null);
-        Alert.alert(
-          "Izin lokasi diperlukan",
-          "Berikan izin lokasi agar kami bisa menampilkan MUA terdekat."
-        );
         return;
       }
 
@@ -232,41 +239,44 @@ export default function MuaListScreen() {
   // ==================== fetchPage ====================
   const fetchPage = useCallback(
     async (targetPage: number, append: boolean) => {
-      const headers = await getAuthHeaders();
-      const url = `${API_MUAS}?page=${targetPage}&per_page=${PAGE_SIZE}`;
-      const json = await safeFetchJSON<any>(url, { headers });
+      try {
+        const headers = await getAuthHeaders();
+        const url = `${API_MUAS}?page=${targetPage}&per_page=${PAGE_SIZE}`;
+        console.log(`[fetchPage] Fetching page ${targetPage}`);
+        
+        const json = await safeFetchJSON<any>(url, { headers });
 
-      // API sample returns `data` and pagination props at root
-      const rawList: any[] = (json as any)?.data ?? (json as any) ?? [];
+        const rawList: any[] = (json as any)?.data ?? (json as any) ?? [];
 
-      // ensure only role === 'mua' (backend already returns mua but extra safety)
-      const filtered: MuaProfile[] = rawList.filter(
-        (it) => it && String(it.role).toLowerCase() === "mua"
-      );
+        const filtered: MuaProfile[] = rawList.filter(
+          (it) => it && String(it.role).toLowerCase() === "mua"
+        );
 
-      // avoid duplicates when appending
-      if (append) {
-        setRows((prev) => {
-          const map = new Map<string, MuaProfile>();
-          prev.forEach((p) => map.set(String(p.id), p));
-          filtered.forEach((p) => map.set(String(p.id), p));
-          return Array.from(map.values());
-        });
-      } else {
-        setRows(filtered);
+        if (append) {
+          setRows((prev) => {
+            const map = new Map<string, MuaProfile>();
+            prev.forEach((p) => map.set(String(p.id), p));
+            filtered.forEach((p) => map.set(String(p.id), p));
+            return Array.from(map.values());
+          });
+        } else {
+          setRows(filtered);
+        }
+
+        if (
+          typeof json.current_page === "number" &&
+          typeof json.last_page === "number"
+        ) {
+          setHasMore(json.current_page < json.last_page);
+        } else {
+          setHasMore(rawList.length >= PAGE_SIZE);
+        }
+
+        setPage(targetPage);
+      } catch (error: any) {
+        console.error("[fetchPage] Error:", error);
+        throw error; // Re-throw to handle in caller
       }
-
-      // pagination detection
-      if (
-        typeof json.current_page === "number" &&
-        typeof json.last_page === "number"
-      ) {
-        setHasMore(json.current_page < json.last_page);
-      } else {
-        setHasMore(rawList.length >= PAGE_SIZE);
-      }
-
-      setPage(targetPage);
     },
     []
   );
@@ -277,10 +287,18 @@ export default function MuaListScreen() {
       await fetchPage(1, false);
     } catch (e: any) {
       if (e?.message === "401_UNAUTH") {
-        Alert.alert("Sesi berakhir", "Silakan login kembali.");
-        await SecureStore.deleteItemAsync("auth").catch(() => {});
-        router.replace("/(auth)/login");
+        console.log("[initialLoad] 401 detected - redirecting to login");
+        Alert.alert("Sesi berakhir", "Silakan login kembali.", [
+          {
+            text: "OK",
+            onPress: () => {
+              router.replace("/(auth)/login");
+            }
+          }
+        ]);
       } else {
+        console.warn("[initialLoad] Other error:", e);
+        Alert.alert("Error", "Gagal memuat data MUA: " + (e.message || "Unknown error"));
         setRows([]);
         setHasMore(false);
       }
@@ -298,10 +316,14 @@ export default function MuaListScreen() {
     setRefreshing(true);
     try {
       await Promise.all([fetchPage(1, false), requestLocation()]);
+    } catch (error: any) {
+      if (error?.message === "401_UNAUTH") {
+        router.replace("/(auth)/login");
+      }
     } finally {
       setRefreshing(false);
     }
-  }, [fetchPage, requestLocation]);
+  }, [fetchPage, requestLocation, router]);
 
   const onEndReached = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current || loading) return;
@@ -309,11 +331,15 @@ export default function MuaListScreen() {
     setLoadingMore(true);
     try {
       await fetchPage(page + 1, true);
+    } catch (error: any) {
+      if (error?.message === "401_UNAUTH") {
+        router.replace("/(auth)/login");
+      }
     } finally {
       setLoadingMore(false);
       loadingMoreRef.current = false;
     }
-  }, [fetchPage, page, hasMore, loading]);
+  }, [fetchPage, page, hasMore, loading, router]);
 
   // computed list (search + sort + jarak)
   const computed = useMemo(() => {
@@ -348,19 +374,13 @@ export default function MuaListScreen() {
     const copy = [...withDist];
     switch (filter) {
       case "nearest":
-        copy.sort(
-          (a, b) => (a._dist ?? Infinity) - (b._dist ?? Infinity)
-        );
+        copy.sort((a, b) => (a._dist ?? Infinity) - (b._dist ?? Infinity));
         break;
       case "cheapest":
-        copy.sort(
-          (a, b) => (a._price ?? Infinity) - (b._price ?? Infinity)
-        );
+        copy.sort((a, b) => (a._price ?? Infinity) - (b._price ?? Infinity));
         break;
       case "expensive":
-        copy.sort(
-          (a, b) => (b._price ?? -Infinity) - (a._price ?? -Infinity)
-        );
+        copy.sort((a, b) => (b._price ?? -Infinity) - (a._price ?? -Infinity));
         break;
       case "newest":
         copy.sort((a, b) => {
@@ -660,7 +680,6 @@ const styles = StyleSheet.create({
     fontSize: 20,
   },
   cardTitle: { fontSize: 16, fontWeight: "800", color: "#111827", flex: 1 },
-  priceText: { marginTop: 2, color: "#111827", fontWeight: "800" },
   addr: { marginTop: 4, color: TEXT_MUTED },
 
   badgesRow: {

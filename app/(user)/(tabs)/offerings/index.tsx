@@ -1,4 +1,3 @@
-// app/(user)/(tabs)/offerings/index.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
@@ -9,11 +8,13 @@ import {
   FlatList,
   ActivityIndicator,
   Platform,
+  Alert,
+  Image,
 } from "react-native";
 import * as Location from "expo-location";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import * as SecureStore from "expo-secure-store";
+import authStorage from "../../../../utils/authStorage"; // ✅ GUNAKAN AUTH STORAGE YANG SAMA
 
 /* =============== Types =============== */
 type OfferingApi = {
@@ -80,59 +81,90 @@ function absolutize(url: string | null | undefined) {
   return `${API_BASE}${url.startsWith("/") ? url : `/${url}`}`;
 }
 
-async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
+// ✅ GUNAKAN AUTH STORAGE YANG SAMA
+type HeaderMap = Record<string, string>;
+
+async function getAuthHeaders(): Promise<HeaderMap> {
   try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
   }
 }
 
-/** Type util: map header sederhana agar cocok dengan HeadersInit */
-type HeaderMap = Record<string, string>;
-
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
-  const base: HeaderMap = { Accept: "application/json" };
-  const given = (init.headers || {}) as HeaderMap;
-  const headers: HeadersInit = { ...base, ...given };
-
-  const res = await fetch(url, {
-    method: init.method ?? "GET",
-    cache: "no-store",
-    ...init,
-    headers,
-  });
-
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-  if (!res.ok) {
-    if (res.status === 401) throw new Error("401_UNAUTH");
-    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
-  }
   try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+    const given = (init.headers || {}) as HeaderMap;
+    const headers: HeadersInit = { ...given, Accept: "application/json" };
+
+    const res = await fetch(url, {
+      method: init.method ?? "GET",
+      cache: "no-store",
+      ...init,
+      headers,
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        console.log("[safeFetchJSON] 401 Unauthorized - Clearing auth");
+        await authStorage.clearAuthAll();
+        throw new Error("401_UNAUTH");
+      }
+      throw new Error(`HTTP ${res.status} — ${text.slice(0, 160)}`);
+    }
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Unexpected non-JSON — ${text.slice(0, 160)}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "401_UNAUTH") {
+      throw error;
+    }
+    console.warn("[safeFetchJSON] Network error:", error);
+    throw new Error("Network error: " + (error instanceof Error ? error.message : String(error)));
   }
 }
 
 async function getUserCoords(): Promise<{ lat: number; lng: number } | null> {
   try {
     const enabled = await Location.hasServicesEnabledAsync();
+    if (!enabled) {
+      console.log("[getUserCoords] Location services disabled");
+      return null;
+    }
+
     const { status } = await Location.requestForegroundPermissionsAsync();
-    if (status !== "granted" || !enabled) return null;
+    if (status !== "granted") {
+      console.log("[getUserCoords] Location permission denied");
+      return null;
+    }
 
+    // Coba dapatkan last known position dulu (lebih cepat)
     const last = await Location.getLastKnownPositionAsync();
-    if (last) return { lat: last.coords.latitude, lng: last.coords.longitude };
+    if (last) {
+      console.log("[getUserCoords] Using last known position");
+      return { lat: last.coords.latitude, lng: last.coords.longitude };
+    }
 
+    // Jika tidak ada last known, dapatkan current position
+    console.log("[getUserCoords] Getting current position");
     const pos = await Location.getCurrentPositionAsync({
       accuracy: Location.Accuracy.Balanced,
     });
     return { lat: pos.coords.latitude, lng: pos.coords.longitude };
-  } catch {
+  } catch (error) {
+    console.warn("[getUserCoords] Error getting location:", error);
     return null;
   }
 }
@@ -157,70 +189,103 @@ export default function OfferingsScreen() {
   // lokasi user (opsional)
   useEffect(() => {
     (async () => {
-      setUserLoc(await getUserCoords());
+      const coords = await getUserCoords();
+      setUserLoc(coords);
+      console.log("[OfferingsScreen] User location:", coords);
     })();
   }, []);
 
-  // fetch MUA map + halaman pertama offerings (dengan Bearer token)
+  // fetch MUA map + halaman pertama offerings
   useEffect(() => {
     (async () => {
       setLoading(true);
       setError(null);
       try {
-        const token = await getAuthToken();
-        const authHeaders: HeaderMap = token ? { Authorization: `Bearer ${token}` } : {};
+        console.log("[OfferingsScreen] Loading initial data...");
+        const headers = await getAuthHeaders();
 
         const [muaJson, offJson] = await Promise.all([
-          safeFetchJSON<{ data: MuaLoc[] }>(API_MUA_LOC, { headers: authHeaders }),
-          safeFetchJSON<ApiPage<OfferingApi>>(API_OFFERINGS, { headers: authHeaders }),
+          safeFetchJSON<{ data: MuaLoc[] }>(API_MUA_LOC, { headers }),
+          safeFetchJSON<ApiPage<OfferingApi>>(API_OFFERINGS, { headers }),
         ]);
 
+        // Build MUA map
         const mmap: Record<string, MuaLoc> = {};
-        for (const m of muaJson.data ?? []) mmap[m.id] = m;
+        const muaData = muaJson.data ?? [];
+        console.log(`[OfferingsScreen] Loaded ${muaData.length} MUA locations`);
+        
+        for (const m of muaData) {
+          mmap[m.id] = m;
+        }
         setMuaMap(mmap);
 
+        // Process offerings
         const page = offJson?.data ?? [];
+        console.log(`[OfferingsScreen] Loaded ${page.length} offerings`);
+        
         const mapped: Row[] = page.map((o) => ({
           ...o,
           priceNum: Number(o.price ?? 0),
           mua: mmap[o.mua_id],
         }));
+        
         setRows(mapped);
         setNextUrl(absolutize(offJson?.next_page_url));
+        
+        console.log(`[OfferingsScreen] Initial data loaded successfully`);
       } catch (e: any) {
+        console.error("[OfferingsScreen] Error loading data:", e);
+        
         if (e?.message === "401_UNAUTH") {
-          setError("Sesi berakhir atau belum login. Silakan login kembali.");
-          await SecureStore.deleteItemAsync("auth").catch(() => {});
-          router.replace("/(auth)/login");
+          setError("Sesi berakhir. Silakan login kembali.");
+          Alert.alert("Sesi Berakhir", "Silakan login kembali.", [
+            {
+              text: "OK",
+              onPress: () => {
+                router.replace("/(auth)/login");
+              }
+            }
+          ]);
         } else {
-          setError(e?.message || "Gagal memuat data.");
+          setError(e?.message || "Gagal memuat data offerings.");
         }
       } finally {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [router]);
 
-  // load more (pakai next_page_url dan Bearer token)
+  // load more (pakai next_page_url)
   async function loadMore() {
     if (!nextUrl || loadingMore) return;
+    
     setLoadingMore(true);
     try {
-      const token = await getAuthToken();
-      const authHeaders: HeaderMap = token ? { Authorization: `Bearer ${token}` } : {};
+      console.log("[OfferingsScreen] Loading more data...");
+      const headers = await getAuthHeaders();
       const url = absolutize(nextUrl) || nextUrl;
 
-      const json = await safeFetchJSON<ApiPage<OfferingApi>>(url, { headers: authHeaders });
+      const json = await safeFetchJSON<ApiPage<OfferingApi>>(url, { headers });
       const page = json?.data ?? [];
+      
+      console.log(`[OfferingsScreen] Loaded ${page.length} more offerings`);
+      
       const mapped: Row[] = page.map((o) => ({
         ...o,
         priceNum: Number(o.price ?? 0),
         mua: muaMap[o.mua_id],
       }));
+      
       setRows((prev) => [...prev, ...mapped]);
       setNextUrl(absolutize(json?.next_page_url));
-    } catch {
-      // noop, bisa tampilkan toast/log jika perlu
+    } catch (e: any) {
+      console.error("[OfferingsScreen] Error loading more:", e);
+      
+      if (e?.message === "401_UNAUTH") {
+        router.replace("/(auth)/login");
+      } else {
+        Alert.alert("Error", "Gagal memuat data tambahan.");
+      }
     } finally {
       setLoadingMore(false);
     }
@@ -228,7 +293,12 @@ export default function OfferingsScreen() {
 
   // tambahkan jarak jika ada userLoc
   const withDistance = useMemo(() => {
-    if (!userLoc) return rows.map((r) => ({ ...r, distanceKm: null }));
+    if (!userLoc) {
+      console.log("[OfferingsScreen] No user location, skipping distance calculation");
+      return rows.map((r) => ({ ...r, distanceKm: null }));
+    }
+    
+    console.log("[OfferingsScreen] Calculating distances for", rows.length, "offerings");
     return rows.map((r) => {
       const lat = Number(r.mua?.location_lat);
       const lng = Number(r.mua?.location_lng);
@@ -241,18 +311,27 @@ export default function OfferingsScreen() {
   // search
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return withDistance;
-    return withDistance.filter((r) => {
+    if (!q) {
+      console.log("[OfferingsScreen] No search query, showing all", withDistance.length, "offerings");
+      return withDistance;
+    }
+    
+    const filteredList = withDistance.filter((r) => {
       const nm = r.name_offer?.toLowerCase() || "";
       const mua = r.mua?.name?.toLowerCase() || "";
       const tp = r.makeup_type?.toLowerCase() || "";
       return nm.includes(q) || mua.includes(q) || tp.includes(q);
     });
+    
+    console.log(`[OfferingsScreen] Search "${q}" found ${filteredList.length} results`);
+    return filteredList;
   }, [withDistance, query]);
 
   // sorting
   const sorted = useMemo(() => {
     const arr = [...filtered];
+    console.log(`[OfferingsScreen] Sorting ${arr.length} items by:`, sort);
+    
     if (sort === "distance") {
       arr.sort((a, b) => {
         const da = a.distanceKm ?? Number.POSITIVE_INFINITY;
@@ -264,6 +343,7 @@ export default function OfferingsScreen() {
     } else if (sort === "priceDesc") {
       arr.sort((a, b) => (b.priceNum || 0) - (a.priceNum || 0));
     }
+    
     return arr;
   }, [filtered, sort]);
 
@@ -271,7 +351,7 @@ export default function OfferingsScreen() {
     const title = item.name_offer || "Tanpa Judul";
     const muaName = item.mua?.name || "MUA";
     const typeLabel = toTitle(item.makeup_type) || "Make Up";
-    const price = formatIDR(item.priceNum || 0);
+    const price = item.priceNum > 0 ? formatIDR(item.priceNum) : "Harga belum tersedia";
 
     const distanceText =
       typeof item.distanceKm === "number"
@@ -279,6 +359,11 @@ export default function OfferingsScreen() {
           ? `${Math.round(item.distanceKm)} km`
           : `${item.distanceKm.toFixed(1)} km`
         : undefined;
+
+    // Handle MUA photo
+    const muaPhoto = item.mua?.photo_url ? 
+      (item.mua.photo_url.startsWith("http") ? item.mua.photo_url : `${API_BASE}${item.mua.photo_url}`) 
+      : null;
 
     return (
       <TouchableOpacity
@@ -289,14 +374,29 @@ export default function OfferingsScreen() {
       >
         <View style={styles.card}>
           <View style={styles.cardInner}>
-            <View style={{ flex: 1, paddingRight: 12 }}>
+            {/* MUA Photo */}
+            {muaPhoto ? (
+              <Image source={{ uri: muaPhoto }} style={styles.muaPhoto} />
+            ) : (
+              <View style={styles.muaPhotoPlaceholder}>
+                <Ionicons name="person" size={20} color={TEXT_MUTED} />
+              </View>
+            )}
+            
+            <View style={{ flex: 1, paddingLeft: 12, paddingRight: 12 }}>
               <Text style={styles.cardTitle} numberOfLines={2}>{title}</Text>
               <Text style={styles.cardSub}>{muaName}</Text>
               <Text style={styles.cardType}>{typeLabel}</Text>
             </View>
+            
             <View style={{ alignItems: "flex-end", justifyContent: "space-between" }}>
               <Text style={styles.cardPrice}>{price}</Text>
-              {distanceText ? <Text style={styles.distance}>{distanceText}</Text> : null}
+              {distanceText ? (
+                <View style={styles.distanceBadge}>
+                  <Ionicons name="location" size={12} color={PURPLE} />
+                  <Text style={styles.distance}>{distanceText}</Text>
+                </View>
+              ) : null}
             </View>
           </View>
         </View>
@@ -311,7 +411,7 @@ export default function OfferingsScreen() {
       <View style={styles.searchWrap}>
         <Ionicons name="search" size={16} color={TEXT_MUTED} style={{ marginLeft: 10 }} />
         <TextInput
-          placeholder="Search"
+          placeholder="Cari jasa, MUA, atau jenis makeup..."
           placeholderTextColor={TEXT_MUTED}
           style={styles.searchInput}
           value={query}
@@ -373,9 +473,21 @@ export default function OfferingsScreen() {
       )}
 
       {loading ? (
-        <ActivityIndicator style={{ marginTop: 30 }} />
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={PURPLE} />
+          <Text style={styles.loadingText}>Memuat daftar jasa...</Text>
+        </View>
       ) : error ? (
-        <Text style={{ color: "crimson", marginHorizontal: 20 }}>{error}</Text>
+        <View style={styles.errorContainer}>
+          <Ionicons name="alert-circle-outline" size={48} color={TEXT_MUTED} />
+          <Text style={styles.errorText}>{error}</Text>
+          <TouchableOpacity 
+            style={styles.retryButton}
+            onPress={() => router.replace("/(auth)/login")}
+          >
+            <Text style={styles.retryButtonText}>Login Kembali</Text>
+          </TouchableOpacity>
+        </View>
       ) : (
         <FlatList
           data={sorted}
@@ -383,18 +495,28 @@ export default function OfferingsScreen() {
           renderItem={renderItem}
           contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 16 }}
           ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+          ListEmptyComponent={
+            <View style={styles.emptyContainer}>
+              <Ionicons name="search-outline" size={64} color={TEXT_MUTED} />
+              <Text style={styles.emptyText}>
+                {query ? "Tidak ada jasa yang sesuai dengan pencarian" : "Belum ada jasa tersedia"}
+              </Text>
+            </View>
+          }
           ListFooterComponent={
             nextUrl ? (
               <TouchableOpacity style={styles.loadMore} onPress={loadMore} disabled={loadingMore}>
                 {loadingMore ? (
-                  <ActivityIndicator />
+                  <ActivityIndicator color={PURPLE} />
                 ) : (
                   <>
-                    <Text style={{ fontWeight: "700", color: "#111" }}>Muat Lebih Banyak</Text>
-                    <Ionicons name="arrow-forward" size={16} />
+                    <Text style={{ fontWeight: "700", color: PURPLE }}>Muat Lebih Banyak</Text>
+                    <Ionicons name="arrow-down" size={16} color={PURPLE} />
                   </>
                 )}
               </TouchableOpacity>
+            ) : sorted.length > 0 ? (
+              <Text style={styles.endOfList}>— Sudah sampai akhir —</Text>
             ) : null
           }
         />
@@ -405,8 +527,18 @@ export default function OfferingsScreen() {
 
 /* =============== Styles =============== */
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 12, android: 8 }) },
-  title: { fontSize: 32, fontWeight: "800", marginHorizontal: 20, marginBottom: 12, color: "#111827" },
+  screen: { 
+    flex: 1, 
+    backgroundColor: "#fff", 
+    paddingTop: Platform.select({ ios: 12, android: 8 }) 
+  },
+  title: { 
+    fontSize: 32, 
+    fontWeight: "800", 
+    marginHorizontal: 20, 
+    marginBottom: 12, 
+    color: "#111827" 
+  },
 
   searchWrap: {
     height: 44,
@@ -420,7 +552,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingRight: 8,
   },
-  searchInput: { flex: 1, paddingHorizontal: 10, color: "#111" },
+  searchInput: { 
+    flex: 1, 
+    paddingHorizontal: 10, 
+    color: "#111",
+    fontSize: 16,
+  },
 
   filterBtn: {
     marginLeft: 8,
@@ -449,18 +586,84 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 2 },
   },
-  filterLabel: { fontSize: 12, color: TEXT_MUTED, marginBottom: 4 },
-  filterRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 6 },
-  filterText: { fontSize: 14, color: "#111827" },
-  filterActiveText: { color: PURPLE, fontWeight: "800" },
+  filterLabel: { 
+    fontSize: 12, 
+    color: TEXT_MUTED, 
+    marginBottom: 4 
+  },
+  filterRow: { 
+    flexDirection: "row", 
+    alignItems: "center", 
+    gap: 8, 
+    paddingVertical: 6 
+  },
+  filterText: { 
+    fontSize: 14, 
+    color: "#111827" 
+  },
+  filterActiveText: { 
+    color: PURPLE, 
+    fontWeight: "800" 
+  },
 
-  card: { backgroundColor: CARD_BG, borderRadius: 14, borderWidth: 1, borderColor: BORDER },
-  cardInner: { padding: 16, flexDirection: "row" },
-  cardTitle: { fontSize: 18, fontWeight: "800", color: "#111827" },
-  cardSub: { color: TEXT_MUTED, marginTop: 6 },
-  cardType: { color: TEXT_MUTED, marginTop: 6 },
-  cardPrice: { fontWeight: "800", color: "#111827", fontSize: 16 },
-  distance: { marginTop: 6, color: TEXT_MUTED, fontSize: 12 },
+  card: { 
+    backgroundColor: CARD_BG, 
+    borderRadius: 14, 
+    borderWidth: 1, 
+    borderColor: BORDER 
+  },
+  cardInner: { 
+    padding: 16, 
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  muaPhoto: {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    backgroundColor: "#eee",
+  },
+  muaPhotoPlaceholder: {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    backgroundColor: "#E5E7EB",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cardTitle: { 
+    fontSize: 16, 
+    fontWeight: "800", 
+    color: "#111827",
+    lineHeight: 20,
+  },
+  cardSub: { 
+    color: TEXT_MUTED, 
+    marginTop: 4,
+    fontSize: 14,
+  },
+  cardType: { 
+    color: TEXT_MUTED, 
+    marginTop: 2, 
+    fontSize: 12,
+  },
+  cardPrice: { 
+    fontWeight: "800", 
+    color: "#111827", 
+    fontSize: 16,
+    textAlign: "right",
+  },
+  distanceBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 6,
+    gap: 4,
+  },
+  distance: { 
+    color: PURPLE, 
+    fontSize: 12,
+    fontWeight: "600",
+  },
 
   loadMore: {
     marginTop: 12,
@@ -474,5 +677,61 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
     backgroundColor: "#fff",
+  },
+  endOfList: {
+    textAlign: "center",
+    color: TEXT_MUTED,
+    marginVertical: 20,
+    fontSize: 14,
+  },
+
+  loadingContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+  },
+  loadingText: {
+    color: TEXT_MUTED,
+    fontSize: 16,
+  },
+
+  errorContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 40,
+    gap: 16,
+  },
+  errorText: {
+    color: TEXT_MUTED,
+    fontSize: 16,
+    textAlign: "center",
+    lineHeight: 24,
+  },
+  retryButton: {
+    backgroundColor: PURPLE,
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginTop: 8,
+  },
+  retryButtonText: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 16,
+  },
+
+  emptyContainer: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 60,
+    gap: 16,
+  },
+  emptyText: {
+    color: TEXT_MUTED,
+    fontSize: 16,
+    textAlign: "center",
+    lineHeight: 24,
   },
 });

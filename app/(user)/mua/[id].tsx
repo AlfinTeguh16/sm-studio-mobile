@@ -1,4 +1,3 @@
-// app/(user)/mua/[id].tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
@@ -15,7 +14,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import MapView, { Marker } from "react-native-maps";
-import * as SecureStore from "expo-secure-store";
+import authStorage from "../../../utils/authStorage";
 
 /* ========= Types ========= */
 type MuaProfile = {
@@ -58,40 +57,55 @@ const BADGE_BG = "#F3E8FF";
 /* ========= Helpers ========= */
 type HeaderMap = Record<string, string>;
 
-async function getAuthToken(): Promise<string | null> {
-  const raw = await SecureStore.getItemAsync("auth");
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.token === "string" ? parsed.token : null;
-  } catch {
-    return null;
-  }
-}
 async function getAuthHeaders(): Promise<HeaderMap> {
-  const token = await getAuthToken();
-  const h: HeaderMap = { Accept: "application/json" };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
+  try {
+    const token = await authStorage.getAuthToken();
+    const h: HeaderMap = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) h.Authorization = `Bearer ${token}`;
+    return h;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
+  }
 }
 
 async function safeFetchJSON<T = any>(url: string, init: RequestInit = {}): Promise<T> {
-  const given = (init.headers || {}) as HeaderMap;
-  const headers: HeadersInit = { ...given, Accept: "application/json" };
-
-  const res = await fetch(url, { method: init.method ?? "GET", cache: "no-store", ...init, headers });
-
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-
-  if (!res.ok) {
-    if (res.status === 401) throw new Error("401_UNAUTH");
-    throw new Error(`HTTP ${res.status} (ct=${ct}) — ${text.slice(0, 160)}`);
-  }
   try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`Unexpected non-JSON (ct=${ct}) — ${text.slice(0, 160)}`);
+    const given = (init.headers || {}) as HeaderMap;
+    const headers: HeadersInit = { ...given, Accept: "application/json" };
+
+    const res = await fetch(url, { 
+      method: init.method ?? "GET", 
+      cache: "no-store", 
+      ...init, 
+      headers 
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        console.log("[safeFetchJSON] 401 Unauthorized - Clearing auth");
+        await authStorage.clearAuthAll();
+        throw new Error("401_UNAUTH");
+      }
+      throw new Error(`HTTP ${res.status} — ${text.slice(0, 160)}`);
+    }
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Unexpected non-JSON — ${text.slice(0, 160)}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "401_UNAUTH") {
+      throw error;
+    }
+    console.warn("[safeFetchJSON] Network error:", error);
+    throw new Error("Network error: " + (error instanceof Error ? error.message : String(error)));
   }
 }
 
@@ -115,21 +129,39 @@ export default function MuaProfileScreen() {
   const [offers, setOffers] = useState<OfferingApi[]>([]);
   const [loadingOffers, setLoadingOffers] = useState(true);
 
+  // Load MUA profile
   useEffect(() => {
     if (!id) return;
+    
     (async () => {
       try {
         setLoading(true);
+        console.log(`[MuaProfile] Loading profile for MUA ID: ${id}`);
+        
         const headers = await getAuthHeaders();
         const json = await safeFetchJSON<ApiResp<MuaProfile>>(`${API_MUA}/${id}`, { headers });
         const data = (json as any)?.data ?? json;
+        
+        console.log(`[MuaProfile] Profile loaded:`, data?.name);
         setProfile(data as MuaProfile);
       } catch (e: any) {
+        console.error(`[MuaProfile] Error loading profile:`, e);
+        
         if (e?.message === "401_UNAUTH") {
-          Alert.alert("Sesi berakhir", "Silakan login kembali.");
-          router.replace("/(auth)/login");
+          Alert.alert("Sesi berakhir", "Silakan login kembali.", [
+            {
+              text: "OK",
+              onPress: () => {
+                router.replace("/(auth)/login");
+              }
+            }
+          ]);
         } else {
-          Alert.alert("Gagal", e?.message || "Tidak bisa memuat profil MUA.");
+          Alert.alert(
+            "Gagal memuat profil", 
+            e?.message || "Tidak bisa memuat profil MUA.",
+            [{ text: "OK" }]
+          );
         }
       } finally {
         setLoading(false);
@@ -137,60 +169,152 @@ export default function MuaProfileScreen() {
     })();
   }, [id, router]);
 
-  // Ambil offerings milik MUA ini
+  // Load offerings for this MUA - PERBAIKAN DI SINI
   useEffect(() => {
     if (!id) return;
+    
     (async () => {
       try {
         setLoadingOffers(true);
+        console.log(`[MuaProfile] Loading offerings for MUA ID: ${id}`);
+        
         const headers = await getAuthHeaders();
+        let list: OfferingApi[] = [];
 
-        // coba server-side filter
-        const resp = await safeFetchJSON<ApiResp<OfferingApi[]>>(`${API_OFFERINGS}?mua_id=${id}`, { headers });
-        const listServer: OfferingApi[] = (resp as any)?.data ?? (resp as OfferingApi[]) ?? [];
+        // Coba endpoint khusus untuk offerings MUA
+        try {
+          // Coba endpoint khusus: /api/mua/{id}/offerings
+          const muaOffersUrl = `${API_MUA}/${id}/offerings`;
+          console.log(`[MuaProfile] Trying MUA-specific offerings endpoint: ${muaOffersUrl}`);
+          
+          const resp = await safeFetchJSON<ApiResp<OfferingApi[]>>(muaOffersUrl, { headers });
+          list = (resp as any)?.data ?? (resp as OfferingApi[]) ?? [];
+          console.log(`[MuaProfile] MUA-specific offerings found:`, list.length);
+          
+        } catch (muaEndpointError) {
+          console.warn(`[MuaProfile] MUA-specific endpoint failed, trying general endpoint with filter:`, muaEndpointError);
+          
+          // Fallback: ambil semua offerings dan filter di client
+          try {
+            const allOffers = await safeFetchJSON<ApiResp<OfferingApi[]>>(API_OFFERINGS, { headers });
+            const allList = (allOffers as any)?.data ?? (allOffers as OfferingApi[]) ?? [];
+            console.log(`[MuaProfile] All offerings loaded:`, allList.length);
+            
+            // Filter yang benar: hanya ambil offerings dengan mua_id yang sesuai
+            list = allList.filter((o: { mua_id: any; id: any; }) => {
+              const offerMuaId = String(o.mua_id).trim();
+              const currentMuaId = String(id).trim();
+              const isMatch = offerMuaId === currentMuaId;
+              
+              if (!isMatch) {
+                console.log(`[MuaProfile] Filtered out offering:`, {
+                  offeringId: o.id,
+                  offeringMuaId: offerMuaId,
+                  currentMuaId: currentMuaId,
+                  match: isMatch
+                });
+              }
+              
+              return isMatch;
+            });
+            
+            console.log(`[MuaProfile] Client-filtered offerings for MUA ${id}:`, list.length);
+            
+          } catch (generalError) {
+            console.error(`[MuaProfile] General endpoint also failed:`, generalError);
+            list = [];
+          }
+        }
 
-        // kalau server belum filter, fallback client-side
-        const list = Array.isArray(listServer) && listServer.length
-          ? listServer
-          : ((await safeFetchJSON<ApiResp<OfferingApi[]>>(API_OFFERINGS, { headers })) as any)?.data ?? [];
+        // Debug: log semua offerings yang ditemukan
+        console.log(`[MuaProfile] Final offerings for MUA ${id}:`, list.map(o => ({
+          id: o.id,
+          name: o.name_offer,
+          mua_id: o.mua_id,
+          match: String(o.mua_id) === String(id)
+        })));
 
-        const filtered = (list as OfferingApi[]).filter((o) => String(o.mua_id) === String(id));
-        setOffers(filtered);
-      } catch {
-        setOffers([]);
+        setOffers(list);
+      } catch (e: any) {
+        console.error(`[MuaProfile] Error loading offerings:`, e);
+        
+        if (e?.message === "401_UNAUTH") {
+          router.replace("/(auth)/login");
+        } else {
+          // Silent fail for offerings - don't show alert
+          setOffers([]);
+        }
       } finally {
         setLoadingOffers(false);
       }
     })();
-  }, [id]);
+  }, [id, router]);
 
-  const lat = useMemo(() => Number(profile?.location_lat), [profile]);
-  const lng = useMemo(() => Number(profile?.location_lng), [profile]);
+  const lat = useMemo(() => {
+    const latVal = profile?.location_lat;
+    return typeof latVal === 'string' ? parseFloat(latVal) : 
+           typeof latVal === 'number' ? latVal : NaN;
+  }, [profile]);
+
+  const lng = useMemo(() => {
+    const lngVal = profile?.location_lng;
+    return typeof lngVal === 'string' ? parseFloat(lngVal) : 
+           typeof lngVal === 'number' ? lngVal : NaN;
+  }, [profile]);
+
   const hasCoords = Number.isFinite(lat) && Number.isFinite(lng);
 
-  const avatar =
-    (profile?.photo_url && profile.photo_url.startsWith("http")
-      ? profile.photo_url
-      : profile?.photo_url
-      ? `${API_ORIGIN}${profile.photo_url.startsWith("/") ? "" : "/"}${profile.photo_url}`
-      : null) || "https://via.placeholder.com/400x400.png?text=MUA";
+  const avatar = useMemo(() => {
+    if (!profile?.photo_url) return "https://via.placeholder.com/400x400.png?text=MUA";
+    
+    const photo = profile.photo_url;
+    if (photo.startsWith("http://") || photo.startsWith("https://")) {
+      return photo;
+    }
+    if (photo.startsWith("/")) {
+      return `${API_ORIGIN}${photo}`;
+    }
+    return `${API_ORIGIN}/${photo}`;
+  }, [profile?.photo_url]);
 
   function openMaps() {
-    if (!hasCoords) return;
+    if (!hasCoords) {
+      Alert.alert("Info", "Lokasi tidak tersedia untuk MUA ini.");
+      return;
+    }
+    
     const q = `${lat},${lng}`;
-    const url =
-      Platform.OS === "ios"
-        ? `http://maps.apple.com/?ll=${q}&q=${encodeURIComponent(profile?.name || "Lokasi")}`
-        : `geo:${q}?q=${q}(${encodeURIComponent(profile?.name || "Lokasi")})`;
+    const locationName = encodeURIComponent(profile?.name || "Lokasi MUA");
+    
+    let url: string;
+    if (Platform.OS === "ios") {
+      url = `http://maps.apple.com/?ll=${q}&q=${locationName}`;
+    } else {
+      url = `geo:${q}?q=${q}(${locationName})`;
+      
+      Linking.canOpenURL(url).then(supported => {
+        if (!supported) {
+          return Linking.openURL(`https://maps.google.com/maps?q=${q}`);
+        }
+        return Linking.openURL(url);
+      }).catch(() => {
+        Linking.openURL(`https://maps.google.com/maps?q=${q}`).catch(() => {
+          Alert.alert("Gagal", "Tidak bisa membuka aplikasi peta.");
+        });
+      });
+      return;
+    }
+    
     Linking.openURL(url).catch(() => {
-      Alert.alert("Gagal", "Tidak bisa membuka peta.");
+      Alert.alert("Gagal", "Tidak bisa membuka aplikasi peta.");
     });
   }
 
   if (loading) {
     return (
       <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <ActivityIndicator />
+        <ActivityIndicator size="large" color={PURPLE} />
+        <Text style={{ marginTop: 12, color: TEXT_MUTED }}>Memuat profil MUA...</Text>
       </View>
     );
   }
@@ -198,12 +322,15 @@ export default function MuaProfileScreen() {
   if (!profile) {
     return (
       <View style={[styles.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <Text>Tidak ada data.</Text>
+        <Ionicons name="person-outline" size={64} color={TEXT_MUTED} />
+        <Text style={{ marginTop: 12, color: TEXT_MUTED, textAlign: "center" }}>
+          Tidak dapat memuat data MUA
+        </Text>
         <TouchableOpacity
-          style={[styles.mapsBtn, { marginTop: 12 }]}
-          onPress={() => router.replace("/(user)/(tabs)/index")}
+          style={[styles.mapsBtn, { marginTop: 16 }]}
+          onPress={() => router.back()}
         >
-          <Text style={{ color: PURPLE, fontWeight: "800" }}>Kembali ke Beranda</Text>
+          <Text style={{ color: PURPLE, fontWeight: "800" }}>Kembali</Text>
         </TouchableOpacity>
       </View>
     );
@@ -220,7 +347,7 @@ export default function MuaProfileScreen() {
         <View style={{ width: 40 }} />
       </View>
 
-      {/* Hero / avatar + nama (tanpa telepon) */}
+      {/* Hero / avatar + nama */}
       <View style={styles.heroCard}>
         <Image source={{ uri: avatar }} style={styles.avatar} />
         <View style={{ flex: 1, marginLeft: 12 }}>
@@ -234,9 +361,7 @@ export default function MuaProfileScreen() {
               <View style={styles.dotOffline} />
             )}
           </View>
-          {/* nomor hp DIHILANGKAN */}
         </View>
-        {/* tombol Telepon DIHILANGKAN */}
       </View>
 
       {/* Services */}
@@ -244,7 +369,7 @@ export default function MuaProfileScreen() {
         <View style={{ paddingHorizontal: 20, marginTop: 12 }}>
           <Text style={styles.sectionTitle}>Layanan</Text>
           <View style={styles.tagsWrap}>
-            {profile.services!.map((s) => (
+            {profile.services.map((s) => (
               <View key={s} style={styles.tag}>
                 <Text style={styles.tagText}>{titleCase(s)}</Text>
               </View>
@@ -275,12 +400,15 @@ export default function MuaProfileScreen() {
                 latitudeDelta: 0.01,
                 longitudeDelta: 0.01,
               }}
+              scrollEnabled={false}
+              zoomEnabled={false}
             >
               <Marker coordinate={{ latitude: lat, longitude: lng }} title={profile.name} />
             </MapView>
           ) : (
             <View style={[StyleSheet.absoluteFillObject, { justifyContent: "center", alignItems: "center" }]}>
-              <Text style={{ color: TEXT_MUTED }}>Koordinat tidak tersedia</Text>
+              <Ionicons name="map-outline" size={32} color={TEXT_MUTED} />
+              <Text style={{ color: TEXT_MUTED, marginTop: 8 }}>Lokasi tidak tersedia</Text>
             </View>
           )}
         </View>
@@ -294,15 +422,19 @@ export default function MuaProfileScreen() {
 
       {/* ===== Jasa dari MUA ini ===== */}
       <View style={{ paddingHorizontal: 20, marginTop: 18 }}>
-        <Text style={styles.sectionTitle}>Jasa dari MUA ini</Text>
+        <Text style={styles.sectionTitle}>Jasa dari {profile.name}</Text>
         {loadingOffers ? (
-          <ActivityIndicator style={{ marginTop: 6 }} />
+          <ActivityIndicator style={{ marginTop: 6 }} color={PURPLE} />
         ) : offers.length === 0 ? (
-          <Text style={{ color: TEXT_MUTED }}>Belum ada jasa.</Text>
+          <Text style={{ color: TEXT_MUTED, textAlign: "center", marginTop: 12 }}>
+            Belum ada jasa yang ditawarkan
+          </Text>
         ) : (
           offers.map((of) => {
             const priceNum = Number(of.price ?? 0);
             const img = of.offer_pictures?.[0];
+            const imageUrl = img ? (img.startsWith("http") ? img : `${API_ORIGIN}/${img}`) : null;
+            
             return (
               <TouchableOpacity
                 key={of.id}
@@ -317,12 +449,16 @@ export default function MuaProfileScreen() {
                   {of.makeup_type ? (
                     <Text style={styles.offerType}>{titleCase(of.makeup_type)}</Text>
                   ) : null}
-                  <Text style={styles.offerPrice}>{formatIDR(priceNum)}</Text>
+                  <Text style={styles.offerPrice}>
+                    {priceNum > 0 ? formatIDR(priceNum) : "Harga belum tersedia"}
+                  </Text>
                 </View>
-                {img ? (
-                  <Image source={{ uri: img }} style={styles.offerThumb} />
+                {imageUrl ? (
+                  <Image source={{ uri: imageUrl }} style={styles.offerThumb} />
                 ) : (
-                  <View style={[styles.offerThumb, { backgroundColor: "#EEE" }]} />
+                  <View style={[styles.offerThumb, { backgroundColor: "#EEE", justifyContent: "center", alignItems: "center" }]}>
+                    <Ionicons name="image-outline" size={24} color={TEXT_MUTED} />
+                  </View>
                 )}
               </TouchableOpacity>
             );
