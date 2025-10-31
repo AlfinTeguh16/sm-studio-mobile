@@ -13,8 +13,7 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { getAuthToken } from "../../../utils/authStorage"; // pastikan ada
-// jika belum ada, buat helper sederhana (lihat catatan di bawah)
+import authStorage from "../../../utils/authStorage";
 
 /* ---------------- types ---------------- */
 type Notif = {
@@ -37,6 +36,21 @@ const TEXT = "#111827";
 const CARD_BG = "#F7F2FA";
 
 /* ---------------- helpers ---------------- */
+async function getAuthHeaders() {
+  try {
+    const token = await authStorage.getAuthToken();
+    const headers: Record<string, string> = { 
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+  } catch (error) {
+    console.warn("[getAuthHeaders] Error:", error);
+    return { Accept: "application/json" };
+  }
+}
+
 const fmtTime = (iso?: string | null) => {
   if (!iso) return "-";
   const d = new Date(iso);
@@ -52,64 +66,126 @@ const fmtTime = (iso?: string | null) => {
 
 function extractBookingIdFromMessage(message?: string | null): string | null {
   const m = String(message ?? "");
-  // #123
-  const mHash = m.match(/#\s*(\d+)/);
-  if (mHash && mHash[1]) return mHash[1];
-  // INV-123
-  const mInv = m.match(/INV[-\s]*([0-9]+)/i);
-  if (mInv && mInv[1]) return mInv[1];
-  // UUID-ish
-  const mUuid = m.match(/([0-9a-fA-F]{8}-[0-9a-fA-F-]{4,36})/);
-  if (mUuid && mUuid[1]) return mUuid[1];
-  // fallback: largest numeric group
-  const allNums = m.match(/(\d{2,})/g);
-  if (allNums && allNums.length) return allNums[allNums.length - 1];
+  console.log("[extractBookingId] Analyzing message:", m);
+  
+  // Debug: Tampilkan semua pattern yang mungkin
+  const patterns = [
+    { name: "INV-full", pattern: /(INV-[A-Z0-9-]+)/i },
+    { name: "INV-code-only", pattern: /INV-(\d{8}-[A-Z0-9]+)/i },
+    { name: "date-code-full", pattern: /(\d{8}-[A-Z0-9]+)/ },
+    { name: "UUID", pattern: /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/ },
+    { name: "hash", pattern: /#\s*(\d+)/ },
+    { name: "long-number", pattern: /(\d{6,})/ },
+  ];
+  
+  console.log("[extractBookingId] Pattern analysis:");
+  for (const { name, pattern } of patterns) {
+    const match = m.match(pattern);
+    if (match) {
+      console.log(`[extractBookingId] ✓ ${name}:`, match[1] || match[0]);
+    }
+  }
+  
+  // Priority 1: Full INV code (INV-20251014-8NZW)
+  const fullInvPattern = /(INV-[A-Z0-9-]+)/i;
+  const fullInvMatch = m.match(fullInvPattern);
+  if (fullInvMatch && fullInvMatch[1]) {
+    console.log("[extractBookingId] Using full INV code:", fullInvMatch[1]);
+    return fullInvMatch[1];
+  }
+  
+  // Priority 2: INV code without prefix (20251014-8NZW)
+  const invCodePattern = /INV-(\d{8}-[A-Z0-9]+)/i;
+  const invCodeMatch = m.match(invCodePattern);
+  if (invCodeMatch && invCodeMatch[1]) {
+    console.log("[extractBookingId] Using INV code without prefix:", invCodeMatch[1]);
+    return invCodeMatch[1];
+  }
+  
+  // Priority 3: Date-code pattern (20251014-8NZW)
+  const dateCodePattern = /(\d{8}-[A-Z0-9]+)/;
+  const dateCodeMatch = m.match(dateCodePattern);
+  if (dateCodeMatch && dateCodeMatch[1]) {
+    console.log("[extractBookingId] Using date-code:", dateCodeMatch[1]);
+    return dateCodeMatch[1];
+  }
+  
+  // Priority 4: UUID pattern
+  const uuidPattern = /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/;
+  const uuidMatch = m.match(uuidPattern);
+  if (uuidMatch && uuidMatch[1]) {
+    console.log("[extractBookingId] Using UUID:", uuidMatch[1]);
+    return uuidMatch[1];
+  }
+  
+  // Priority 5: Numeric ID dengan #
+  const hashPattern = /#\s*(\d+)/;
+  const hashMatch = m.match(hashPattern);
+  if (hashMatch && hashMatch[1]) {
+    console.log("[extractBookingId] Using hash pattern:", hashMatch[1]);
+    return hashMatch[1];
+  }
+  
+  // Priority 6: Long numeric ID
+  const longNumberPattern = /(\d{6,})/;
+  const longNumberMatch = m.match(longNumberPattern);
+  if (longNumberMatch && longNumberMatch[1]) {
+    console.log("[extractBookingId] Using long number:", longNumberMatch[1]);
+    return longNumberMatch[1];
+  }
+  
+  console.warn("[extractBookingId] No valid booking ID found in message:", m);
   return null;
 }
 
-/** safe fetch JSON helper — surfaces non-JSON responses with snippet */
+/** Safe fetch dengan debug info */
 async function fetchJSON(url: string, options: RequestInit = {}) {
-  const res = await fetch(url, {
+  const headers = await getAuthHeaders();
+  const fullOptions = {
     ...options,
     headers: {
-      Accept: "application/json",
+      ...headers,
       ...(options.headers || {}),
     },
+  };
+
+  console.log(`[fetchJSON] ${options.method || 'GET'} ${url}`, {
+    headers: fullOptions.headers,
+    body: fullOptions.body
   });
 
-  const ct = res.headers.get("content-type") || "";
+  const res = await fetch(url, fullOptions);
   const text = await res.text();
 
-  if (!ct.includes("application/json")) {
-    const preview = (text || "").slice(0, 400).replace(/\s+/g, " ");
-    const err: any = new Error(`Expected JSON but got ${res.status} ${res.statusText}: ${preview}`);
-    err.status = res.status;
-    throw err;
-  }
+  console.log(`[fetchJSON] Response ${res.status}:`, text.substring(0, 200));
 
-  let json: any;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    const err: any = new Error("Invalid JSON response");
-    err.status = res.status;
-    throw err;
+  // Handle unauthorized
+  if (res.status === 401) {
+    await authStorage.clearAuthAll();
+    throw new Error("Sesi berakhir. Silakan login kembali.");
   }
 
   if (!res.ok) {
-    const msg = json?.message || json?.error || `${res.status} ${res.statusText}`;
-    const err: any = new Error(msg);
-    err.status = res.status;
-    throw err;
+    let errorMsg = `HTTP ${res.status}`;
+    try {
+      const json = JSON.parse(text);
+      errorMsg = json?.message || json?.error || errorMsg;
+    } catch {
+      errorMsg = text.substring(0, 100) || errorMsg;
+    }
+    throw new Error(errorMsg);
   }
 
-  return json;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON response");
+  }
 }
 
 /* ---------------- component ---------------- */
 export default function NotificationsScreen() {
   const router = useRouter();
-
   const [items, setItems] = useState<Notif[]>([]);
   const [page, setPage] = useState<number>(1);
   const [hasMore, setHasMore] = useState(true);
@@ -118,80 +194,58 @@ export default function NotificationsScreen() {
   const [busy, setBusy] = useState(false);
   const [unreadCount, setUnreadCount] = useState<number>(0);
 
-  const unreadEndpoints = [
-    `${API_BASE}/notifications/unread-count`,
-    `${API_BASE}/notifications/unread_count`,
-    `${API_BASE}/notifications/count`,
-    `${API_BASE}/notifications/unread`,
-  ];
-
   const fetchUnreadCount = useCallback(async () => {
     try {
-      const token = await getAuthToken();
-      if (!token) {
+      const json = await fetchJSON(`${API_BASE}/notifications/unread-count`);
+      const count = json?.count ?? json?.data?.count ?? json?.unread ?? 0;
+      setUnreadCount(Number(count) || 0);
+    } catch (e: any) {
+      console.warn("[fetchUnreadCount] Error:", e);
+      // Jika endpoint tidak ada, set ke 0 (bukan error fatal)
+      if (e.message.includes("404") || e.message.includes("No query results")) {
+        console.log("[fetchUnreadCount] Endpoint not available, setting to 0");
         setUnreadCount(0);
-        return;
+      } else {
+        setUnreadCount(0);
       }
-      let ok = false;
-      for (const url of unreadEndpoints) {
-        try {
-          const json = await fetchJSON(url, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          const candidate = json?.count ?? json?.data?.count ?? json?.unread ?? json;
-          const n = typeof candidate === "number" ? candidate : Number(candidate ?? 0);
-          setUnreadCount(Number.isFinite(n) ? n : 0);
-          ok = true;
-          break;
-        } catch (err) {
-          // try next
-        }
-      }
-      if (!ok) setUnreadCount(0);
-    } catch (e) {
-      console.warn("fetchUnreadCount failed:", e);
-      setUnreadCount(0);
     }
   }, []);
 
   const fetchPage = useCallback(async (p = 1) => {
-    try {
-      const token = await getAuthToken();
-      const url = `${API_BASE}/notifications?per_page=20&page=${p}`;
-      const json = await fetchJSON(url, {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      });
-      const list = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
-      const lastPage = Number(json?.last_page ?? 1) || 1;
-      return { list: list as Notif[], lastPage };
-    } catch (err) {
-      console.warn("fetchPage notifications failed:", err);
-      return { list: [] as Notif[], lastPage: 1 };
-    }
+    const url = `${API_BASE}/notifications?page=${p}`;
+    const json = await fetchJSON(url);
+    
+    const list = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
+    const lastPage = Number(json?.last_page ?? json?.meta?.last_page ?? 1) || 1;
+    
+    return { list: list as Notif[], lastPage };
   }, []);
 
+  // Initial load
   useEffect(() => {
     let alive = true;
+    
     (async () => {
       setLoading(true);
       try {
         const { list, lastPage } = await fetchPage(1);
         if (!alive) return;
+        
         setItems(list);
         setPage(1);
         setHasMore(1 < lastPage);
         await fetchUnreadCount();
       } catch (e: any) {
-        Alert.alert("Gagal", e?.message || "Tidak bisa memuat notifikasi");
+        if (!alive) return;
+        console.error("[NotificationsScreen] Initial load error:", e);
         setItems([]);
         setHasMore(false);
       } finally {
         if (alive) setLoading(false);
       }
     })();
-    return () => {
-      alive = false;
-    };
+    
+    return () => { alive = false; };
   }, [fetchPage, fetchUnreadCount]);
 
   const onRefresh = useCallback(async () => {
@@ -202,8 +256,8 @@ export default function NotificationsScreen() {
       setPage(1);
       setHasMore(1 < lastPage);
       await fetchUnreadCount();
-    } catch (err) {
-      console.warn("refresh failed:", err);
+    } catch (e: any) {
+      console.error("[NotificationsScreen] Refresh error:", e);
     } finally {
       setRefreshing(false);
     }
@@ -211,6 +265,7 @@ export default function NotificationsScreen() {
 
   const loadMore = useCallback(async () => {
     if (loading || busy || !hasMore) return;
+    
     setBusy(true);
     try {
       const next = page + 1;
@@ -218,271 +273,407 @@ export default function NotificationsScreen() {
       setItems((prev) => [...prev, ...list]);
       setPage(next);
       setHasMore(next < lastPage);
-    } catch (err) {
-      console.warn("loadMore failed:", err);
+    } catch (e: any) {
+      console.error("[NotificationsScreen] Load more error:", e);
     } finally {
       setBusy(false);
     }
   }, [page, fetchPage, hasMore, loading, busy]);
 
-  const markRead = useCallback(
-    async (id: string | number, read = true) => {
-      try {
-        const token = await getAuthToken();
-        if (!token) throw new Error("Butuh login");
-        // endpoint backend bervariasi — coba POST /notifications/{id}/mark
-        await fetchJSON(`${API_BASE}/notifications/${encodeURIComponent(String(id))}/mark`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ is_read: read }),
-        });
-        setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: read } : n)));
-        await fetchUnreadCount();
-      } catch (err) {
-        console.warn("markRead failed:", err);
-        setItems((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: read } : n)));
-      }
-    },
-    [fetchUnreadCount]
-  );
+  const markRead = useCallback(async (id: string | number, read = true) => {
+    try {
+      await fetchJSON(`${API_BASE}/notifications/${id}/read`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_read: read }),
+      });
+      setItems((prev) => prev.map((n) => n.id === id ? { ...n, is_read: read } : n));
+      fetchUnreadCount();
+    } catch (e: any) {
+      console.warn("[markRead] Error:", e);
+    }
+  }, [fetchUnreadCount]);
 
-  const deleteOne = useCallback(
-    async (id: string | number) => {
-      try {
-        const token = await getAuthToken();
-        if (!token) throw new Error("Butuh login");
-        await fetchJSON(`${API_BASE}/notifications/${encodeURIComponent(String(id))}`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        setItems((prev) => prev.filter((n) => n.id !== id));
-        await fetchUnreadCount();
-      } catch (err) {
-        console.warn("deleteOne failed:", err);
-        // Alert.alert("Gagal", err?.message || "Tidak bisa menghapus notifikasi.");
-      }
-    },
-    [fetchUnreadCount]
-  );
+  const deleteOne = useCallback(async (id: string | number) => {
+    Alert.alert(
+      "Hapus Notifikasi",
+      "Apakah Anda yakin ingin menghapus notifikasi ini?",
+      [
+        { text: "Batal", style: "cancel" },
+        {
+          text: "Hapus",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await fetchJSON(`${API_BASE}/notifications/${id}`, { method: "DELETE" });
+              setItems((prev) => prev.filter((n) => n.id !== id));
+              fetchUnreadCount();
+            } catch (e: any) {
+              console.warn("[deleteOne] Error:", e);
+              Alert.alert("Error", "Gagal menghapus notifikasi");
+            }
+          },
+        },
+      ]
+    );
+  }, [fetchUnreadCount]);
 
   const markAllRead = useCallback(async () => {
-    try {
-      const token = await getAuthToken();
-      if (!token) throw new Error("Butuh login");
-      await fetchJSON(`${API_BASE}/notifications/mark-all-read`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setItems((prev) => prev.map((n) => ({ ...n, is_read: true })));
-      await fetchUnreadCount();
-    } catch (err) {
-      console.warn("markAllRead failed:", err);
-      // Alert.alert("Gagal", err?.message || "Tidak bisa menandai semua sebagai dibaca.");
-    }
+    Alert.alert(
+      "Tandai Semua Dibaca",
+      "Apakah Anda yakin ingin menandai semua notifikasi sebagai sudah dibaca?",
+      [
+        { text: "Batal", style: "cancel" },
+        {
+          text: "Tandai Semua",
+          onPress: async () => {
+            try {
+              await fetchJSON(`${API_BASE}/notifications/read-all`, { method: "PATCH" });
+              setItems((prev) => prev.map((n) => ({ ...n, is_read: true })));
+              fetchUnreadCount();
+              Alert.alert("Berhasil", "Semua notifikasi telah ditandai sebagai dibaca");
+            } catch (e: any) {
+              console.warn("[markAllRead] Error:", e);
+              Alert.alert("Error", "Gagal menandai semua notifikasi");
+            }
+          },
+        },
+      ]
+    );
   }, [fetchUnreadCount]);
 
   const clearRead = useCallback(async () => {
-    try {
-      const token = await getAuthToken();
-      if (!token) throw new Error("Butuh login");
-      await fetchJSON(`${API_BASE}/notifications/clear-read`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-      setItems((prev) => prev.filter((n) => !n.is_read));
-      await fetchUnreadCount();
-    } catch (err) {
-      console.warn("clearRead failed:", err);
-      // Alert.alert("Gagal", err?.message || "Tidak bisa membersihkan notifikasi dibaca.");
-    }
+    Alert.alert(
+      "Bersihkan Notifikasi Dibaca",
+      "Apakah Anda yakin ingin menghapus semua notifikasi yang sudah dibaca?",
+      [
+        { text: "Batal", style: "cancel" },
+        {
+          text: "Bersihkan",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await fetchJSON(`${API_BASE}/notifications/clear-read`, { method: "POST" });
+              setItems((prev) => prev.filter((n) => !n.is_read));
+              fetchUnreadCount();
+              Alert.alert("Berhasil", "Notifikasi yang sudah dibaca telah dihapus");
+            } catch (e: any) {
+              console.warn("[clearRead] Error:", e);
+              Alert.alert("Error", "Gagal membersihkan notifikasi");
+            }
+          },
+        },
+      ]
+    );
   }, [fetchUnreadCount]);
 
 
-
-async function respondInvite(notif: Notif, action: "accept" | "decline") {
-  const status = action === "accept" ? "accepted" : "declined";
-  const bookingId = extractBookingIdFromMessage(notif.message ?? null);
-
-  if (!bookingId) {
-    Alert.alert("Tidak dapat menanggapi", "ID booking tidak ditemukan pada notifikasi. Periksa pesan.");
-    return;
+  function extractInvoiceNumberFromMessage(message?: string | null): string | null {
+    const m = String(message ?? "");
+    console.log("[extractInvoiceNumber] Analyzing message:", m);
+    
+    // Priority 1: Cari full INV code (INV-20251014-8NZW)
+    const fullInvPattern = /(INV-\d{8}-[A-Z0-9]+)/i;
+    const fullInvMatch = m.match(fullInvPattern);
+    if (fullInvMatch && fullInvMatch[1]) {
+      console.log("[extractInvoiceNumber] Found full INV code:", fullInvMatch[1]);
+      return fullInvMatch[1];
+    }
+    
+    // Priority 2: Cari invoice number dalam format lain
+    const invoicePatterns = [
+      /(INV-\d+)/i,
+      /(#[A-Z0-9-]+)/i,
+      /booking\s+([A-Z0-9-]+)/i
+    ];
+    
+    for (const pattern of invoicePatterns) {
+      const match = m.match(pattern);
+      if (match && match[1]) {
+        console.log("[extractInvoiceNumber] Found invoice pattern:", match[1]);
+        return match[1];
+      }
+    }
+    
+    console.warn("[extractInvoiceNumber] No invoice number found in message:", m);
+    return null;
   }
 
-  // ambil token & profile untuk diagnosa
-  const token = await getAuthToken();
-  if (!token) {
-    Alert.alert("Butuh login", "Silakan login terlebih dahulu.");
-    return;
-  }
-
+  // FIXED: respondInvite function dengan multiple ID format attempts
+  // FIXED: respondInvite dengan pencarian ID numeric booking
+const respondInvite = useCallback(async (notif: Notif, action: "accept" | "decline") => {
+  console.log("[respondInvite] Starting with action:", action);
+  console.log("[respondInvite] Notification data:", notif);
+  
   try {
-    // optional: ambil /auth/me untuk memastikan profile id
-    const meRes = await fetch("https://smstudio.my.id/api/auth/me", {
-      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-    });
-    const meText = await meRes.text();
-    let meJson: any = null;
-    try { meJson = JSON.parse(meText); } catch {}
-    const me = (meJson && meJson.data) ? meJson.data : meJson ?? null;
-    console.log("[respondInvite] auth/me ->", me);
+    // 1. Dapatkan auth data
+    const authData = await authStorage.getAuthData();
+    
+    if (!authData?.token || !authData?.user?.id) {
+      Alert.alert("Error", "Token tidak ditemukan. Silakan login ulang.");
+      return;
+    }
 
-    // kirim request ke endpoint respond (controller expects 'status')
-    const url = `https://smstudio.my.id/api/bookings/${encodeURIComponent(String(bookingId))}/collaborators/respond`;
-    const res = await fetch(url, {
+    const status = action === "accept" ? "accepted" : "declined";
+
+    // 2. Extract invoice number dari message
+    const invoiceNumber = extractInvoiceNumberFromMessage(notif.message);
+    console.log("[respondInvite] Extracted invoice number:", invoiceNumber);
+
+    if (!invoiceNumber) {
+      Alert.alert("Error", "Tidak dapat menemukan invoice number dari notifikasi.");
+      return;
+    }
+
+    // 3. Cari booking ID numeric berdasarkan invoice number
+    console.log("[respondInvite] Searching for booking ID by invoice number...");
+    let numericBookingId: number | null = null;
+    
+    try {
+      // Dapatkan semua bookings untuk mencari yang sesuai
+      const bookingsResponse = await fetchJSON(`${API_BASE}/bookings`);
+      const bookings = Array.isArray(bookingsResponse?.data) ? bookingsResponse.data : 
+                      Array.isArray(bookingsResponse) ? bookingsResponse : [];
+      
+      console.log("[respondInvite] Available bookings count:", bookings.length);
+      
+      // Cari booking yang invoice_number-nya sesuai
+      const matchingBooking = bookings.find((booking: any) => 
+        booking.invoice_number === invoiceNumber
+      );
+      
+      if (matchingBooking) {
+        numericBookingId = matchingBooking.id;
+        console.log("[respondInvite] Found booking ID:", numericBookingId, "for invoice:", invoiceNumber);
+      } else {
+        console.warn("[respondInvite] No booking found for invoice:", invoiceNumber);
+        
+        // Fallback: cari berdasarkan partial match
+        const partialMatch = bookings.find((booking: any) => 
+          booking.invoice_number && booking.invoice_number.includes(invoiceNumber.replace(/^INV-/, ''))
+        );
+        
+        if (partialMatch) {
+          numericBookingId = partialMatch.id;
+          console.log("[respondInvite] Found partial match booking ID:", numericBookingId);
+        }
+      }
+    } catch (bookingsError) {
+      console.error("[respondInvite] Bookings search failed:", bookingsError);
+    }
+
+    // 4. Jika tidak ditemukan, coba collaborations endpoint
+    if (!numericBookingId) {
+      console.log("[respondInvite] Trying collaborations endpoint...");
+      try {
+        const collaborationsResponse = await fetchJSON(`${API_BASE}/mua/collaborations`);
+        const collaborations = Array.isArray(collaborationsResponse?.data) ? collaborationsResponse.data : 
+                             Array.isArray(collaborationsResponse) ? collaborationsResponse : [];
+        
+        // Cari collaboration yang pending untuk notifikasi ini
+        const pendingCollaboration = collaborations.find((collab: any) => 
+          collab.status === 'invited' && collab.notification_id === notif.id
+        );
+        
+        if (pendingCollaboration) {
+          console.log("[respondInvite] Found pending collaboration:", pendingCollaboration);
+          
+          // Update langsung di collaborations
+          const updateResponse = await fetchJSON(`${API_BASE}/mua/collaborations/${pendingCollaboration.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: status })
+          });
+          
+          console.log("[respondInvite] Collaboration update success:", updateResponse);
+          
+          await markRead(notif.id, true);
+          setItems(prev => prev.filter(item => item.id !== notif.id));
+          await fetchUnreadCount();
+          
+          Alert.alert("Sukses", 
+            action === "accept" ? "Undangan berhasil diterima!" : "Undangan berhasil ditolak."
+          );
+          return;
+        }
+      } catch (collabError) {
+        console.warn("[respondInvite] Collaborations approach failed:", collabError);
+      }
+      
+      // Jika masih tidak ditemukan, beri error
+      Alert.alert(
+        "Error", 
+        `Tidak dapat menemukan data booking untuk:\n${invoiceNumber}\n\nSilakan hubungi administrator.`
+      );
+      return;
+    }
+
+    // 5. Gunakan numeric booking ID untuk respond
+    console.log("[respondInvite] Using numeric booking ID:", numericBookingId);
+    
+    const response = await fetchJSON(`${API_BASE}/bookings/${numericBookingId}/collaborators/respond`, {
       method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ 
+        status: status,
+        notification_id: notif.id,
+        user_id: authData.user.id
+      }),
     });
 
-    const ct = res.headers.get("content-type") ?? "";
-    const text = await res.text();
+    console.log("[respondInvite] Success:", response);
 
-    // jika backend kirim HTML atau redirect -> tampilkan snippet
-    if (!ct.includes("application/json")) {
-      throw new Error(`Unexpected response (not JSON): ${text.slice(0, 400)}`);
-    }
+    await markRead(notif.id, true);
+    setItems(prev => prev.filter(item => item.id !== notif.id));
+    await fetchUnreadCount();
+    
+    Alert.alert("Sukses", 
+      action === "accept" ? "Undangan berhasil diterima!" : "Undangan berhasil ditolak."
+    );
 
-    const j = JSON.parse(text);
-    if (!res.ok) {
-      // tunjukkan pesan yang dikembalikan server (j.message) atau fallback
-      throw new Error(j?.message || j?.error || `HTTP ${res.status}`);
-    }
+  } catch (error: any) {
+    console.error("[respondInvite] Error:", error);
+    
+    let errorMessage = "Terjadi kesalahan saat memproses undangan";
+    
+    if (error.message.includes("Not found") || error.message.includes("not invited")) {
+      errorMessage = `
+Undangan tidak ditemukan atau sudah kedaluwarsa. 
 
-    // sukses
-    Alert.alert("Sukses", j?.message || "Tanggapan tersimpan.");
-    // update UI: hapus notifikasi / tandai dibaca
-    // (panggil fungsi markRead / fetchUnreadCount seperti sebelumnya)
-  } catch (err: any) {
-    console.warn("respondInvite error:", err);
-    // Detil error user-friendly
-    if (String(err.message || "").toLowerCase().includes("not found") ||
-        String(err.message || "").toLowerCase().includes("not invited")) {
-      Alert.alert("Gagal", "Undangan tidak ditemukan atau Anda bukan kolaborator untuk booking ini. Periksa bookingId / akun Anda.");
+Kemungkinan penyebab:
+• Data collaboration tidak ditemukan di database
+• Undangan sudah direspon sebelumnya
+• Ada ketidaksesuaian data
+
+Silakan hubungi administrator.
+`;
     } else {
-      Alert.alert("Gagal", err?.message || String(err));
+      errorMessage = error.message || errorMessage;
     }
+    
+    Alert.alert("Gagal", errorMessage);
   }
-}
+}, [markRead, fetchUnreadCount]);
 
-
+  // Invite Card Component
   const InviteCard = useCallback(
     ({ item }: { item: Notif }) => {
-      const bookingId = extractBookingIdFromMessage(item.message ?? null);
+      const bookingId = extractBookingIdFromMessage(item.message);
+      
       return (
-        <View style={[styles.cardInvite]}>
-          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-            <Text style={[styles.titleInvite]} numberOfLines={2}>
+        <View style={styles.cardInvite}>
+          <View style={styles.inviteHeader}>
+            <Text style={styles.titleInvite} numberOfLines={2}>
               {item.title ?? "Undangan Kolaborasi"}
             </Text>
-            <Text style={{ color: MUTED, fontSize: 12 }}>{fmtTime(item.created_at ?? null)}</Text>
+            <Text style={styles.inviteTime}>
+              {fmtTime(item.created_at)}
+            </Text>
           </View>
 
-          <Text style={[styles.msgInvite, { marginTop: 8 }]}>{String(item.message ?? "")}</Text>
+          <Text style={styles.msgInvite}>
+            {String(item.message ?? "")}
+          </Text>
 
-          {bookingId ? (
-            <Text style={[styles.metaInvite]}>
-              Booking: <Text style={{ fontWeight: "800" }}>{bookingId}</Text>
+          <Text style={styles.metaInvite}>
+            Booking ID: <Text style={{ fontWeight: "800" }}>
+              {bookingId || "tidak terdeteksi"}
             </Text>
-          ) : (
-            <Text style={[styles.metaInvite]}>
-              Booking: <Text style={{ fontStyle: "italic" }}>tidak diketahui</Text>
-            </Text>
-          )}
+          </Text>
 
-          <View style={{ flexDirection: "row", marginTop: 12, gap: 8 }}>
+          <View style={styles.inviteActions}>
             <TouchableOpacity
-              style={[styles.btnAccept]}
+              style={styles.btnAccept}
               onPress={() =>
-                Alert.alert("Konfirmasi", "Terima undangan ini?", [
-                  { text: "Batal", style: "cancel" },
-                  { text: "Terima", onPress: () => respondInvite(item, "accept") },
-                ])
+                Alert.alert(
+                  "Terima Undangan", 
+                  "Anda yakin ingin menerima undangan kolaborasi ini?",
+                  [
+                    { text: "Batal", style: "cancel" },
+                    { text: "Terima", onPress: () => respondInvite(item, "accept") },
+                  ]
+                )
               }
             >
-              <Text style={{ color: "#fff", fontWeight: "800" }}>Terima</Text>
+              <Text style={styles.btnAcceptText}>Terima</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.btnDecline]}
+              style={styles.btnDecline}
               onPress={() =>
-                Alert.alert("Konfirmasi", "Tolak undangan ini?", [
-                  { text: "Batal", style: "cancel" },
-                  { text: "Tolak", onPress: () => respondInvite(item, "decline") },
-                ])
+                Alert.alert(
+                  "Tolak Undangan", 
+                  "Anda yakin ingin menolak undangan kolaborasi ini?",
+                  [
+                    { text: "Batal", style: "cancel" },
+                    { text: "Tolak", style: "destructive", onPress: () => respondInvite(item, "decline") },
+                  ]
+                )
               }
             >
-              <Text style={{ color: "#111827", fontWeight: "700" }}>Tolak</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={[styles.iconBtnSmall]} onPress={() => markRead(item.id, !item.is_read)}>
-              <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
-            </TouchableOpacity>
-
-            <TouchableOpacity style={[styles.iconBtnSmall, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]} onPress={() => deleteOne(item.id)}>
-              <Ionicons name="trash-outline" size={18} color="#DC2626" />
+              <Text style={styles.btnDeclineText}>Tolak</Text>
             </TouchableOpacity>
           </View>
         </View>
       );
     },
-    [respondInvite, markRead, deleteOne]
+    [respondInvite]
   );
 
   const renderItem = useCallback(
     ({ item }: { item: Notif }) => {
       const m = String(item.message ?? "");
-      const isInvite = item.type === "booking_invite" || /mengundang/i.test(m);
-      const color = item.type === "booking" ? "#0EA5E9" : item.type === "payment" ? "#10B981" : "#A78BFA";
+      const isInvite = item.type === "booking_invite" || /mengundang|undang|kolaborasi|collaborat/i.test(m.toLowerCase());
+      
+      console.log("[renderItem] Notification type:", item.type, "isInvite:", isInvite);
 
       if (isInvite) {
         return (
-          <View style={{ paddingHorizontal: 16 }}>
+          <View style={styles.inviteContainer}>
             <InviteCard item={item} />
           </View>
         );
       }
 
+      const color = item.type === "booking" ? "#0EA5E9" : 
+                   item.type === "payment" ? "#10B981" : "#A78BFA";
+
       return (
         <TouchableOpacity
-          onPress={() => router.push({ pathname: "/(mua)/notifications/[id]", params: { id: String(item.id ?? "") } })}
-          style={[styles.card, !item.is_read && { backgroundColor: "#F8FAFF", borderColor: "#DBEAFE" }]}
+          onPress={() => router.push({ 
+            pathname: "/(mua)/notifications/[id]", 
+            params: { id: String(item.id) } 
+          })}
+          style={[styles.card, !item.is_read && styles.unreadCard]}
           activeOpacity={0.9}
         >
           <View style={[styles.badgeType, { borderColor: color, backgroundColor: `${color}1A` }]}>
-            <Text style={{ color, fontWeight: "800", fontSize: 12 }}>{(item.type ?? "GEN").toUpperCase()}</Text>
+            <Text style={{ color, fontWeight: "800", fontSize: 12 }}>
+              {(item.type ?? "system").toUpperCase()}
+            </Text>
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.title, !item.is_read && { color: TEXT }]} numberOfLines={2}>
-              {item.title}
+          
+          <View style={styles.cardContent}>
+            <Text style={[styles.title, !item.is_read && styles.unreadTitle]} numberOfLines={2}>
+              {item.title || "No Title"}
             </Text>
             <Text style={styles.msg} numberOfLines={2}>
               {String(item.message ?? "")}
             </Text>
-            <Text style={styles.time}>{fmtTime(item.created_at ?? null)}</Text>
-          </View>
-
-          <View style={{ marginLeft: 10, alignItems: "flex-end", gap: 8 }}>
-            <TouchableOpacity onPress={() => markRead(item.id, !item.is_read)} style={styles.iconBtn}>
-              <Ionicons name={item.is_read ? "mail-open-outline" : "mail-unread-outline"} size={18} color="#111" />
-            </TouchableOpacity>
-            <TouchableOpacity onPress={() => deleteOne(item.id)} style={[styles.iconBtn, { backgroundColor: "#FEE2E2", borderColor: "#FCA5A5" }]}>
-              <Ionicons name="trash-outline" size={18} color="#DC2626" />
-            </TouchableOpacity>
+            <Text style={styles.time}>
+              {fmtTime(item.created_at)}
+            </Text>
           </View>
 
           {!item.is_read && <View style={styles.unreadDot} />}
         </TouchableOpacity>
       );
     },
-    [InviteCard, markRead, deleteOne, router]
+    [InviteCard, router]
   );
 
   if (loading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator color={PURPLE} />
-        <Text style={{ color: MUTED, marginTop: 6 }}>Memuat…</Text>
+        <ActivityIndicator size="large" color={PURPLE} />
+        <Text style={styles.loadingText}>Memuat notifikasi…</Text>
       </View>
     );
   }
@@ -491,99 +682,319 @@ async function respondInvite(notif: Notif, action: "accept" | "decline") {
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Notifikasi</Text>
-        <View style={{ flexDirection: "row", gap: 8 }}>
+        <View style={styles.headerActions}>
           <TouchableOpacity onPress={markAllRead} style={styles.hBtn}>
-            <Ionicons name="checkmark-done-outline" size={16} color="#111" />
+            <Ionicons name="checkmark-done-outline" size={16} color={PURPLE} />
             <Text style={styles.hBtnText}>Tandai Baca</Text>
           </TouchableOpacity>
+          
           <TouchableOpacity onPress={clearRead} style={styles.hBtn}>
-            <Ionicons name="trash-outline" size={16} color="#111" />
-            <Text style={styles.hBtnText}>Bersihkan Dibaca</Text>
+            <Ionicons name="trash-outline" size={16} color="#DC2626" />
+            <Text style={styles.hBtnText}>Bersihkan</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      <View style={styles.counterRow}>
-        <Text style={{ color: MUTED }}>Belum dibaca</Text>
-        <View style={styles.counterBadge}>
-          <Text style={{ color: "#fff", fontWeight: "800" }}>{unreadCount}</Text>
+      {unreadCount > 0 && (
+        <View style={styles.counterRow}>
+          <Text style={styles.counterText}>Notifikasi belum dibaca</Text>
+          <View style={styles.counterBadge}>
+            <Text style={styles.counterBadgeText}>{unreadCount}</Text>
+          </View>
         </View>
-      </View>
+      )}
 
-      <FlatList<Notif>
+      <FlatList
         data={items}
         keyExtractor={(it) => String(it.id)}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
-        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+        refreshControl={
+          <RefreshControl 
+            refreshing={refreshing} 
+            onRefresh={onRefresh}
+            colors={[PURPLE]}
+            tintColor={PURPLE}
+          />
+        }
+        contentContainerStyle={[
+          styles.listContent,
+          items.length === 0 && styles.emptyListContent
+        ]}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
         renderItem={renderItem}
         onEndReachedThreshold={0.3}
         onEndReached={loadMore}
-        ListFooterComponent={busy ? <ActivityIndicator style={{ marginTop: 8 }} /> : null}
-        ListEmptyComponent={<Text style={{ color: MUTED, padding: 16 }}>Tidak ada notifikasi.</Text>}
+        ListFooterComponent={
+          busy ? (
+            <View style={styles.footerLoader}>
+              <ActivityIndicator color={PURPLE} />
+              <Text style={styles.footerText}>Memuat lebih banyak...</Text>
+            </View>
+          ) : null
+        }
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            <Ionicons name="notifications-off-outline" size={64} color={MUTED} />
+            <Text style={styles.emptyTitle}>Tidak ada notifikasi</Text>
+            <Text style={styles.emptyText}>
+              Notifikasi baru akan muncul di sini
+            </Text>
+          </View>
+        }
       />
     </View>
   );
 }
 
-/* ---------------- styles ---------------- */
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#fff", paddingTop: Platform.select({ ios: 8, android: 4 }) },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" },
-  header: { paddingHorizontal: 16, paddingVertical: 10, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  headerTitle: { fontWeight: "800", fontSize: 18, color: TEXT },
-  hBtn: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 10, height: 34, borderRadius: 8, borderWidth: 1, borderColor: BORDER, backgroundColor: "#fff" },
-  hBtnText: { color: "#111827", fontWeight: "700" },
-
-  counterRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 6 },
-  counterBadge: { backgroundColor: PURPLE, paddingHorizontal: 10, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center" },
-
-  card: { borderWidth: 1, borderColor: BORDER, backgroundColor: "#fff", borderRadius: 12, padding: 12, flexDirection: "row", alignItems: "center" },
-  badgeType: { borderWidth: 1, paddingVertical: 4, paddingHorizontal: 8, borderRadius: 999, marginRight: 10 },
-  title: { fontWeight: "800", color: TEXT },
-  msg: { color: MUTED, marginTop: 4 },
-  time: { color: MUTED, marginTop: 6, fontSize: 12 },
-  iconBtn: { width: 34, height: 34, borderRadius: 8, borderWidth: 1, borderColor: BORDER, backgroundColor: "#fff", alignItems: "center", justifyContent: "center" },
-  unreadDot: { position: "absolute", right: 8, top: 8, width: 10, height: 10, borderRadius: 5, backgroundColor: "#EF4444" },
-
-  /* Invite card */
+  screen: { 
+    flex: 1, 
+    backgroundColor: "#fff", 
+    paddingTop: Platform.select({ ios: 12, android: 8 }) 
+  },
+  center: { 
+    flex: 1, 
+    alignItems: "center", 
+    justifyContent: "center", 
+    backgroundColor: "#fff" 
+  },
+  loadingText: {
+    color: MUTED, 
+    marginTop: 12,
+    fontSize: 14
+  },
+  header: { 
+    paddingHorizontal: 16, 
+    paddingVertical: 12, 
+    flexDirection: "row", 
+    justifyContent: "space-between", 
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: BORDER,
+  },
+  headerTitle: { 
+    fontWeight: "800", 
+    fontSize: 20, 
+    color: TEXT 
+  },
+  headerActions: {
+    flexDirection: "row", 
+    gap: 8
+  },
+  hBtn: { 
+    flexDirection: "row", 
+    alignItems: "center", 
+    gap: 6, 
+    paddingHorizontal: 12, 
+    height: 36, 
+    borderRadius: 8, 
+    borderWidth: 1, 
+    borderColor: BORDER, 
+    backgroundColor: "#fff" 
+  },
+  hBtnText: { 
+    color: "#111827", 
+    fontWeight: "600",
+    fontSize: 12,
+  },
+  counterRow: { 
+    flexDirection: "row", 
+    alignItems: "center", 
+    justifyContent: "space-between", 
+    paddingHorizontal: 16, 
+    paddingVertical: 12,
+    backgroundColor: "#F8FAFF",
+    marginHorizontal: 16,
+    marginTop: 12,
+    borderRadius: 8,
+  },
+  counterText: {
+    color: MUTED,
+    fontSize: 14
+  },
+  counterBadge: { 
+    backgroundColor: PURPLE, 
+    paddingHorizontal: 12, 
+    height: 24, 
+    borderRadius: 12, 
+    alignItems: "center", 
+    justifyContent: "center",
+    minWidth: 24,
+  },
+  counterBadgeText: { 
+    color: "#fff", 
+    fontWeight: "800", 
+    fontSize: 12 
+  },
+  listContent: {
+    paddingHorizontal: 16, 
+    paddingBottom: 24,
+  },
+  emptyListContent: {
+    flex: 1
+  },
+  separator: {
+    height: 10
+  },
+  inviteContainer: {
+    paddingHorizontal: 16,
+  },
+  card: { 
+    borderWidth: 1, 
+    borderColor: BORDER, 
+    backgroundColor: "#fff", 
+    borderRadius: 12, 
+    padding: 16, 
+    flexDirection: "row", 
+    alignItems: "flex-start",
+    position: "relative",
+  },
+  unreadCard: {
+    backgroundColor: "#F8FAFF", 
+    borderColor: "#DBEAFE"
+  },
+  cardContent: {
+    flex: 1,
+    marginRight: 12
+  },
+  badgeType: { 
+    borderWidth: 1, 
+    paddingVertical: 4, 
+    paddingHorizontal: 8, 
+    borderRadius: 6, 
+    marginRight: 12,
+    alignSelf: 'flex-start',
+  },
+  title: { 
+    fontWeight: "600", 
+    color: TEXT,
+    fontSize: 15,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  unreadTitle: {
+    color: TEXT, 
+    fontWeight: "800" 
+  },
+  msg: { 
+    color: MUTED, 
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  time: { 
+    color: MUTED, 
+    marginTop: 8, 
+    fontSize: 12 
+  },
+  unreadDot: { 
+    position: "absolute", 
+    right: 12, 
+    top: 12, 
+    width: 8, 
+    height: 8, 
+    borderRadius: 4, 
+    backgroundColor: "#EF4444" 
+  },
   cardInvite: {
-    borderWidth: 1,
-    borderColor: BORDER,
+    borderWidth: 2,
+    borderColor: PURPLE,
     backgroundColor: CARD_BG,
     borderRadius: 12,
-    padding: 14,
+    padding: 16,
+    marginVertical: 4,
   },
-  titleInvite: { fontWeight: "900", fontSize: 15, color: TEXT },
-  msgInvite: { color: MUTED },
-  metaInvite: { color: MUTED, marginTop: 8, fontSize: 13 },
+  inviteHeader: {
+    flexDirection: "row", 
+    justifyContent: "space-between", 
+    alignItems: "flex-start",
+    marginBottom: 8,
+  },
+  titleInvite: { 
+    fontWeight: "900", 
+    fontSize: 16, 
+    color: TEXT,
+    flex: 1,
+    marginRight: 12
+  },
+  inviteTime: { 
+    color: MUTED, 
+    fontSize: 12 
+  },
+  msgInvite: { 
+    color: MUTED,
+    fontSize: 14,
+    lineHeight: 18,
+    marginBottom: 8
+  },
+  metaInvite: { 
+    color: MUTED, 
+    fontSize: 13 
+  },
+  inviteActions: {
+    flexDirection: "row", 
+    marginTop: 12, 
+    gap: 8,
+    alignItems: "center"
+  },
   btnAccept: {
     backgroundColor: "#10B981",
     paddingHorizontal: 16,
-    height: 44,
-    borderRadius: 12,
+    height: 36,
+    borderRadius: 8,
     alignItems: "center",
     justifyContent: "center",
+    flex: 1,
+  },
+  btnAcceptText: { 
+    color: "#fff", 
+    fontWeight: "800",
+    fontSize: 14
   },
   btnDecline: {
     backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: "#D1D5DB",
-    paddingHorizontal: 14,
-    height: 44,
-    borderRadius: 12,
+    paddingHorizontal: 16,
+    height: 36,
+    borderRadius: 8,
     alignItems: "center",
     justifyContent: "center",
+    flex: 1,
   },
-  iconBtnSmall: {
-    width: 38,
-    height: 38,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#fff",
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: 8,
+  btnDeclineText: { 
+    color: "#111827", 
+    fontWeight: "700",
+    fontSize: 14
+  },
+  footerLoader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 16,
+    gap: 8,
+  },
+  footerText: {
+    color: MUTED,
+    fontSize: 14,
+  },
+  emptyContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 60,
+    paddingHorizontal: 40,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: TEXT,
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  emptyText: {
+    fontSize: 14,
+    color: MUTED,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 24,
   },
 });

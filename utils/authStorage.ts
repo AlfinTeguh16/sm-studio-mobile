@@ -218,6 +218,29 @@ export async function getUserProfile(): Promise<StoredProfile | null> {
   }
 }
 
+// --- NEW: Get complete auth data ---
+export async function getAuthData(): Promise<{
+  token: string | null;
+  user: StoredProfile | null;
+} | null> {
+  try {
+    const [token, profile] = await Promise.all([
+      getAuthToken(),
+      getUserProfile()
+    ]);
+    
+    if (!token && !profile) return null;
+    
+    return {
+      token,
+      user: profile
+    };
+  } catch (e) {
+    console.warn("getAuthData failed", e);
+    return null;
+  }
+}
+
 // --- Clear helper ---
 export async function clearAuthAll() {
   try {
@@ -236,6 +259,7 @@ export async function clearAuthAll() {
 export default {
   getAuthToken,
   getUserProfile,
+  getAuthData, 
   setAuthToken,
   setUserProfile,
   getRefreshToken,
